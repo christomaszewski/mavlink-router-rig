@@ -1,0 +1,58 @@
+# Example rig config for the mavlink-router service (a thin wrap of upstream mavlink-router).
+# Copy + rename per vehicle (e.g. configs/fcu.yaml), edit, then:
+#   ./mavlink-router-up configs/fcu.yaml up -d
+# This is also the config CI's `rig certify` job runs against (the launcher-contract gate).
+#
+# The router fans every MAVLink message out to every other endpoint (with per-endpoint filters if
+# declared), so ONE instance connects the flight controller to the GCS, the autonomy stack, and
+# any dynamic TCP clients. tools/render_conf.py maps this onto upstream's main.conf INI; keys you
+# omit keep upstream's own defaults.
+
+service: mavlink-router
+name: fcu                       # instance id -> compose project mavlink-router_fcu (standalone)
+
+general:
+  tcp_server_port: 5760         # built-in TCP server for dynamic clients (QGC over TCP, debugging;
+                                # 0 disables). Also what the container healthcheck probes.
+  debug_log_level: info         # error | warning | info | debug | trace  (stderr -> `rig logs`)
+  # report_stats: true          # per-endpoint message statistics on stderr
+  # dedup_period_ms: 100        # drop duplicates across redundant links; must exceed the slowest
+  #                             # link's latency (0 = off — keep off unless links are redundant)
+  # mavlink_dialect: auto       # auto | common | ardupilotmega (flight-log parsing dialect)
+
+uart_endpoints:                 # the flight controller link. At most ONE (the serial compose
+                                # overlay passes exactly one device through).
+  - name: fcu
+    device: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0  # stable by-id path,
+                                # NOT /dev/ttyUSB0 (renumbering) and NOT by-path (colons break
+                                # the compose device mapping)
+    baud: 500000
+    # flow_control: false
+
+udp_endpoints:
+  - name: gcs                   # ground station: it sends first (server mode = bind + learn peer)
+    mode: server
+    address: 0.0.0.0
+    port: 14550
+  - name: autonomy              # onboard stack (MAVSDK/mavros) listening on localhost
+    mode: normal                # normal = send-to this address; replies are learned
+    address: 127.0.0.1
+    port: 14540
+
+# tcp_endpoints:                # optional persistent TCP client connections
+#   - name: cloud
+#     address: 192.168.1.20
+#     port: 5761
+#     retry_timeout: 5          # seconds between reconnect attempts (0 = no reconnect)
+
+# logging:                      # OPTIONAL flight-stack (.bin/.ulg) + telemetry (.tlog) logging.
+#   enabled: true               # adds the logging compose overlay -> RIG_DATA_DIR bind
+#   mode: while-armed           # always | while-armed
+#   telemetry: true             # also record raw .tlog (uses the same mode)
+#   max_log_files: 50           # retention — upstream defaults to UNLIMITED; set one of these
+#   min_free_space_mb: 512      # ... or free-space-driven deletion (MB, mapped to upstream bytes)
+
+# Any endpoint may carry a `filters:` map, passed VERBATIM into main.conf — message/source
+# filtering and endpoint grouping (AllowMsgIdOut, BlockSrcSysIn, Group, ...; see upstream
+# examples/config.sample). Example: only HEARTBEAT+sys_status out to a bandwidth-poor radio:
+#   filters: {AllowMsgIdOut: [0, 1]}

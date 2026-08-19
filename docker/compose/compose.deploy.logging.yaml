@@ -1,0 +1,13 @@
+# Logging overlay for compose.deploy.yaml: persist flight-stack (.bin/.ulg) and telemetry (.tlog)
+# logs under the rig data dir. `mavlink-router-up` adds this as an extra `-f` only when the
+# config's `logging.enabled` is true (the rendered main.conf then carries
+# Log=/var/log/mavlink-router, the container side of this bind).
+#
+# RIG_DATA_DIR is rig-injected on a vehicle; a standalone run must export it — the :? makes a
+# missing value a loud error instead of a bind rooted at "/". Retention is the config's
+# max_log_files / min_free_space_mb (both default off upstream — an unbounded volume is the
+# default failure mode, so the example config sets max_log_files).
+services:
+  router:
+    volumes:
+      - ${RIG_DATA_DIR:?logging.enabled needs RIG_DATA_DIR}/mavlink-router/${MAVROUTER_NAME}:/var/log/mavlink-router

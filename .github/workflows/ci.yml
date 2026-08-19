@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the runtime image FROM BOTH PINS — the gate that proves each pinned
+  # source (sources/upstream.repos AND sources/fork.repos) still fetches and
+  # compiles, so a fork rebase or an upstream bump can't silently break the
+  # other. No push: `rig build` (tools/build_image.sh) publishes; CI validates.
+  # ---------------------------------------------------------------------------
+  build-image:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [upstream, fork]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: resolve pin (${{ matrix.source }})
+        id: pin
+        run: |
+          pin="sources/${{ matrix.source }}.repos"
+          echo "url=$(awk '$1 == "url:" {print $2}' "$pin")" >> "$GITHUB_OUTPUT"
+          echo "ref=$(awk '$1 == "version:" {print $2}' "$pin")" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runtime
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.source }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.source }}
+          build-args: |
+            MAVROUTER_URL=${{ steps.pin.outputs.url }}
+            MAVROUTER_REF=${{ steps.pin.outputs.ref }}
+
+  # ---------------------------------------------------------------------------
+  # rig launcher contract, executable (see rigging.yaml). `rig certify` runs
+  # `mavlink-router-up <config> config` under a poisoned fleet env and asserts
+  # the contract held: COMPOSE_PROJECT_NAME honored (no -p), image pulled from
+  # RIG_IMAGE_REGISTRY as :RIG_IMAGE_TAG (build/pull agreement), deterministic +
+  # name-derived output. Bare runner — needs docker compose + PyYAML, not ROS.
+  # ---------------------------------------------------------------------------
+  certify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig
+          path: .rig
+      - run: python3 -m pip install --user pyyaml
+      - name: rig certify (launcher contract)
+        run: ./.rig/rig certify --repo . --config configs/mavlink-router.example.yaml
+
+  # ---------------------------------------------------------------------------
+  # Shell hygiene on the deploy surface (launcher + build script + entrypoints).
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck launcher + build script + entrypoints
+        run: shellcheck mavlink-router-up tools/build_image.sh docker/entrypoints/*.sh

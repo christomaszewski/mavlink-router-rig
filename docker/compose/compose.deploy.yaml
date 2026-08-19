@@ -1,0 +1,25 @@
+# Deployment-grade compose for ONE mavlink-router instance — parameterized + launched by
+# `mavlink-router-up` (which renders main.conf and exports the env vars below). Run it via the
+# launcher, not directly.
+#
+# Multi-instance safe: NO container_name; identity comes from the compose project (the
+# rig-injected COMPOSE_PROJECT_NAME, or mavlink-router_<name> standalone — the launcher handles
+# both). Health comes from the image's baked HEALTHCHECK (TCP connect to the instance's
+# TcpServerPort, or process liveness when the TCP server is disabled).
+services:
+  router:
+    # Image precedence (Docker Compose interpolation): MAVROUTER_IMAGE (a full per-service
+    # override, e.g. a local mavlink_router:dev) wins; else the rig-injected fleet policy —
+    # RIG_IMAGE_REGISTRY prefixed onto mavlink_router, pulled as :RIG_IMAGE_TAG (what `rig build`
+    # pushed); else the bare local mavlink_router:latest (default dev/standalone behavior).
+    image: ${MAVROUTER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}mavlink_router:${RIG_IMAGE_TAG:-latest}}
+    network_mode: host          # UDP/TCP endpoints bind host ports directly (GCS link, autonomy,
+                                # telemetry radios); MAVLink peers expect the host's addresses
+    restart: unless-stopped
+    environment:
+      # the instance's TcpServerPort, so the baked healthcheck probes ITS port
+      # (0 = TCP server disabled -> process-liveness fallback)
+      MAVROUTER_HEALTH_PORT: ${MAVROUTER_HEALTH_PORT:-5760}
+    volumes:
+      # the single rendered router config, read-only (a single-file mount)
+      - ${MAVROUTER_CONF_HOST}:/etc/mavlink-router/main.conf:ro

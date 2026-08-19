@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+# Minimal production image for upstream mavlink-router, VENDORED AT BUILD TIME. Self-contained
+# two-stage build (modeled on upstream's examples/Dockerfile.alpine): the build stage clones the
+# pinned source and compiles it (meson/ninja, release); the runtime stage ships only the
+# mavlink-routerd binary on alpine + libstdc++.
+#
+# MAVROUTER_URL / MAVROUTER_REF come from tools/build_image.sh, which resolves them from
+# sources/<source>.repos (MAVROUTER_SOURCE=upstream|fork, default in sources/DEFAULT). The
+# defaults below mirror sources/upstream.repos so a bare
+#   docker build -f docker/Dockerfile.runtime -t mavlink_router:latest .
+# still builds the pinned upstream.
+ARG MAVROUTER_URL=https://github.com/mavlink-router/mavlink-router.git
+ARG MAVROUTER_REF=2362c620f483cef1edd574fb962a373a288e4b9e
+
+# ---- build stage ------------------------------------------------------------
+FROM alpine:3 AS build
+ARG MAVROUTER_URL
+ARG MAVROUTER_REF
+RUN apk add --no-cache gcc g++ git pkgconf meson ninja linux-headers
+
+WORKDIR /workspace
+# Full clone (not shallow): upstream's tools/meson-vcs-tag.sh embeds `git describe` into the
+# binary's --version output, which needs tag history; the repo is small. The mavlink C library
+# submodule is REQUIRED — the tree does not compile without it.
+RUN git clone "${MAVROUTER_URL}" src \
+ && git -C src checkout --detach "${MAVROUTER_REF}" \
+ && git -C src submodule update --init --recursive
+
+# -Dsystemdsystemunitdir: 'auto' asks pkg-config for systemd, absent on alpine — pin the path so
+# configure succeeds (nothing is installed there; we only ship the binary).
+RUN meson setup build src --buildtype=release -Dsystemdsystemunitdir=/usr/lib/systemd/system \
+ && ninja -C build
+
+# ---- runtime stage ----------------------------------------------------------
+FROM alpine:3 AS runtime
+ARG MAVROUTER_URL
+ARG MAVROUTER_REF
+# libstdc++: the one shared lib the binary needs beyond musl. musl-utils: ldd for the gate below.
+# netcat-openbsd: the healthcheck's TCP probe (busybox nc has no reliable -z).
+RUN apk add --no-cache libstdc++ musl-utils netcat-openbsd
+
+COPY --from=build /workspace/build/src/mavlink-routerd /usr/bin/mavlink-routerd
+# Gate: the shipped binary must resolve ALL its shared libs against exactly what this stage
+# installed — catches a new upstream link dependency at image-build time (CI) instead of as an
+# exec failure on the vehicle. (--version goes through the argv-error exit path upstream, so it
+# is printed for the build log but not used as a gate.)
+RUN gaps="$(ldd /usr/bin/mavlink-routerd | grep 'not found' || true)" \
+ && if [ -n "$gaps" ]; then \
+      echo "ERROR: mavlink-routerd has unresolved shared libraries:"; echo "$gaps"; exit 1; \
+    fi \
+ && (/usr/bin/mavlink-routerd --version || true)
+
+COPY docker/entrypoints/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/entrypoints/healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
+
+# Provenance: which source (upstream vs fork) and which exact rev this image was built from —
+# `docker image inspect` answers "what is this vehicle actually running?".
+LABEL org.opencontainers.image.title="mavlink_router" \
+      org.opencontainers.image.source="${MAVROUTER_URL}" \
+      org.opencontainers.image.revision="${MAVROUTER_REF}"
+
+# The router starts fast (no sensor handshake) — short start-period; the probe is a local TCP
+# connect (or pidof when the TCP server is disabled), see healthcheck.sh.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/usr/local/bin/healthcheck.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

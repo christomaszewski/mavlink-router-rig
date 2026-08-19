@@ -1,0 +1,32 @@
+# rig service descriptor — how rig drives this repo's launcher (schema: bringup rig_cli/descriptor.py).
+service: mavlink-router
+launcher: mavlink-router-up
+tier: infra                     # shared MAVLink hub — up before sensors/autonomy, down after
+
+verbs:
+  up: "up -d"
+  down: "down"
+  status: "ps"
+  logs: "logs"
+  config: "config"
+
+examples:
+  - configs/mavlink-router.example.yaml
+
+build:
+  command: tools/build_image.sh
+  images: [mavlink_router]
+
+host_ports:
+  - "general.tcp_server_port"   # UDP endpoint ports are list-valued — rig doctor's dotted config
+                                # paths can't reach into lists; keep those uncollided by hand
+
+launch_surface:
+  - mavlink-router-up
+  - tools/render_conf.py
+  - docker/compose/compose.deploy.yaml
+  - docker/compose/compose.deploy.serial.yaml
+  - docker/compose/compose.deploy.logging.yaml
+
+# no ros_distro: not a ROS service (raw MAVLink over serial/UDP/TCP)
+# no external_volumes: nothing persists outside the optional RIG_DATA_DIR logging bind

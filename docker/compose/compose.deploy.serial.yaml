@@ -1,0 +1,12 @@
+# Serial overlay for compose.deploy.yaml: pass the host serial device through to the container.
+# `mavlink-router-up` adds this as a second `-f` only when the config has a UART endpoint,
+# exporting MAVROUTER_DEVICE = uart_endpoints[0].device. The same stable /dev/serial/by-id path
+# is used as the in-container device, so the rendered main.conf needs no path rewriting.
+# (render_conf.py rejects by-path device paths — their colons would break the mapping below —
+# and enforces at most ONE UART endpoint, the single slot this overlay carries.)
+services:
+  router:
+    devices:
+      - "${MAVROUTER_DEVICE}:${MAVROUTER_DEVICE}"
+    group_add:
+      - dialout

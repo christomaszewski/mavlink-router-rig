@@ -1,0 +1,11 @@
+# Source pin for the UPSTREAM mavlink-router (vcstool .repos format, same shape as ouster.repos).
+# `version` MUST be an exact tag or full commit SHA — never a branch — so image builds are
+# reproducible and the registry manifest's rev means something. Update = bump `version`, rebuild,
+# skim upstream's changelog for config-key changes, commit as e.g. "vendor mavlink-router <ref>".
+#
+# Selected by tools/build_image.sh when MAVROUTER_SOURCE=upstream (or sources/DEFAULT says so).
+repositories:
+  mavlink-router:
+    type: git
+    url: https://github.com/mavlink-router/mavlink-router.git
+    version: 2362c620f483cef1edd574fb962a373a288e4b9e  # master 2026-03 (v4 + 16), the July 2026 latency-review commit

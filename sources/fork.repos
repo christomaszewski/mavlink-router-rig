@@ -1,0 +1,11 @@
+# Source pin for the PERSONAL FORK of mavlink-router — where latency fixes land (TX queue for
+# EAGAIN drops, non-blocking TCP connect, async log IO, client-side TCP_NODELAY) ahead of, or
+# instead of, upstream. Same rules as upstream.repos: `version` is an exact tag or full SHA.
+#
+# Selected by tools/build_image.sh when MAVROUTER_SOURCE=fork (or sources/DEFAULT says so).
+# Currently pinned to the same commit as upstream (the fork starts unmodified).
+repositories:
+  mavlink-router:
+    type: git
+    url: https://github.com/christomaszewski/mavlink-router.git
+    version: 2362c620f483cef1edd574fb962a373a288e4b9e  # == upstream pin until the first fix lands

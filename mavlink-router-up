@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# mavlink-router-up <config.yaml> [up [-d] | down | status | logs [args] | config | ...]
+#
+# Bring up ONE mavlink-router instance from ONE generic rig config (the single source of truth).
+# Reads the config, derives the instance identity (compose project = an inherited
+# COMPOSE_PROJECT_NAME — rig owns it — or mavlink-router_<name> standalone), renders the UPSTREAM
+# router's main.conf INI, and runs `docker compose`. It SELECTS + PARAMETERIZES static compose
+# files — it never generates one: the serial overlay joins only when the config has a UART
+# endpoint, the logging overlay only when logging.enabled is true.
+#
+#   mavlink-router-up configs/fcu.yaml             # up (foreground)
+#   mavlink-router-up configs/fcu.yaml up -d       # detached
+#   mavlink-router-up configs/fcu.yaml status      # docker compose ps
+#   mavlink-router-up configs/fcu.yaml logs -f
+#   mavlink-router-up configs/fcu.yaml down
+#   mavlink-router-up configs/fcu.yaml config      # render the merged compose
+#   mavlink-router-up /any/host/path/fcu.yaml up -d    # config from anywhere (rig)
+#
+# Multiple routers = run it per config; each is its own compose project, so instances never
+# collide (mind the host ports — network_mode: host). This repo does NOT depend on rig (one-way;
+# see rigging.yaml).
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${MAVROUTER_PYTHON:-python3}"
+
+CONFIG="${1:?usage: mavlink-router-up <config.yaml> [up [-d]|down|status|logs|config|...]}"
+shift || true
+[ -f "$CONFIG" ] || { echo "mavlink-router-up: config not found: $CONFIG" >&2; exit 1; }
+CONFIG_ABS="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "mavlink-router-up: needs the Docker Compose v2 plugin ('docker compose')" >&2
+  exit 1
+fi
+
+# config -> instance identity + derived tokens (SERVICE / NAME / TYPE / DEVICE / HEALTH_PORT /
+# LOGGING). Values are shell-quoted by the renderer, so the eval is safe for device paths.
+eval "$("$PYTHON" "$REPO/tools/render_conf.py" --env "$CONFIG_ABS" | sed 's/^/export /')"
+PROJECT="${SERVICE}_${NAME}"
+
+# Render the router config to a host staging path (one rendered file per instance).
+mkdir -p "$REPO/var/run"
+CONF_HOST="$REPO/var/run/${NAME}.conf"
+"$PYTHON" "$REPO/tools/render_conf.py" "$CONFIG_ABS" > "$CONF_HOST"
+
+# Compose env: this instance's rendered config, name, and health port. The deploy image is
+# resolved by the compose file itself (MAVROUTER_IMAGE override -> RIG_IMAGE_REGISTRY -> local
+# mavlink_router:latest), so a standalone run needs no rig and no registry; export
+# MAVROUTER_IMAGE to force a specific image.
+export MAVROUTER_CONF_HOST="$CONF_HOST"
+export MAVROUTER_NAME="$NAME"
+export MAVROUTER_HEALTH_PORT="$HEALTH_PORT"
+
+FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
+if [ "$TYPE" = "serial" ]; then
+  export MAVROUTER_DEVICE="${DEVICE:?serial config needs uart_endpoints[0].device}"
+  FILES+=(-f "$REPO/docker/compose/compose.deploy.serial.yaml")
+fi
+if [ "$LOGGING" = "1" ]; then
+  FILES+=(-f "$REPO/docker/compose/compose.deploy.logging.yaml")
+fi
+
+# Verbs: `status` -> `ps`; everything else is forwarded to `docker compose` verbatim. No args = up.
+ARGS=("$@")
+[ ${#ARGS[@]} -eq 0 ] && ARGS=(up)
+[ "${ARGS[0]}" = "status" ] && ARGS=(ps "${ARGS[@]:1}")
+
+# rig owns the compose project name (it exports COMPOSE_PROJECT_NAME per call); honor it when
+# inherited, fall back to <service>_<name> standalone. NEVER pass -p — overriding the
+# orchestrator's project name orphans the containers from `rig status`/`rig down`.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT}"
+
+echo "mavlink-router-up: project=$COMPOSE_PROJECT_NAME type=$TYPE conf=$CONF_HOST" >&2
+exec docker compose "${FILES[@]}" "${ARGS[@]}"
