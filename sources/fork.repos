@@ -3,9 +3,11 @@
 # instead of, upstream. Same rules as upstream.repos: `version` is an exact tag or full SHA.
 #
 # Selected by tools/build_image.sh when MAVROUTER_SOURCE=fork (or sources/DEFAULT says so).
-# Currently pinned to the same commit as upstream (the fork starts unmodified).
+# Pinned to the rig/integration branch: the merge of all seven fix/* branches (non-blocking TCP
+# connect, TX queue, log IO off the routing thread x2, client TCP_NODELAY, filter pass-by-ref,
+# UDP MSG_TRUNC) on top of the upstream pin.
 repositories:
   mavlink-router:
     type: git
     url: https://github.com/christomaszewski/mavlink-router.git
-    version: 2362c620f483cef1edd574fb962a373a288e4b9e  # == upstream pin until the first fix lands
+    version: 7c17d357dab725fde6775cabbaa832ce022c0656  # rig/integration 2026-08-19
