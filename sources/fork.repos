@@ -5,9 +5,10 @@
 # Selected by tools/build_image.sh when MAVROUTER_SOURCE=fork (or sources/DEFAULT says so).
 # Pinned to the rig/integration branch: the merge of all seven fix/* branches (non-blocking TCP
 # connect, TX queue, log IO off the routing thread x2, client TCP_NODELAY, filter pass-by-ref,
-# UDP MSG_TRUNC) on top of the upstream pin.
+# UDP MSG_TRUNC), the CI fix completing upstream #495, and upstream PR #492 (ulog bounds check),
+# on top of the upstream pin. Previous pin ccd9f9b is kept as tag rig/integration-2026-08-20.
 repositories:
   mavlink-router:
     type: git
     url: https://github.com/christomaszewski/mavlink-router.git
-    version: ccd9f9b6fdda0e272086cef86275e9e853c79c65  # rig/integration 2026-08-20 (fully green CI)
+    version: 2fbf41b8587f4ad049333e7dafcb207bf7b77198  # rig/integration 2026-09-02 (review fixes folded in, upstream #492 cherry-picked; all 6 CI lanes green)
