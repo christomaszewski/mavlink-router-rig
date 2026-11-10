@@ -1,13 +1,26 @@
 # Logging overlay for compose.deploy.yaml: persist flight-stack (.bin/.ulg) and telemetry (.tlog)
 # logs under the rig data dir. `mavlink-router-up` adds this as an extra `-f` only when the
-# config's `logging.enabled` is true (the rendered main.conf then carries
-# Log=/var/log/mavlink-router, the container side of this bind).
+# config's `logging.enabled` is true.
+#
+# The WHOLE data dir is bound at /data, and the path below it is chosen inside the container:
+#   <data>/current/mavlink-router/<name>   when rig has a run open (`current` -> runs/<id>) — the
+#                                          logs then belong to that run, like every recorder's
+#   <data>/mavlink-router/<name>           the flat layout: standalone, or no run registry
+# The image's entrypoint resolves `current` ONCE at container start and pins the router to that
+# run (rig's writer rule: a recording stays in the run it started in, so a later run rotation
+# cannot pull a log file out from under it). The run id deliberately never appears here — a run
+# path in this file would be frozen into a baked artifact — which is why the bind is the data
+# dir itself and not a per-instance subdirectory. MAVROUTER_LOG_INSTANCE is what tells the
+# entrypoint that logging is on and which instance directory is its own.
 #
 # RIG_DATA_DIR is rig-injected on a vehicle; a standalone run must export it — the :? makes a
 # missing value a loud error instead of a bind rooted at "/". Retention is the config's
 # max_log_files / min_free_space_mb (both default off upstream — an unbounded volume is the
-# default failure mode, so the example config sets max_log_files).
+# default failure mode); upstream applies it per log directory, so under rig it prunes within
+# the open run only and never touches a sealed one.
 services:
   router:
+    environment:
+      MAVROUTER_LOG_INSTANCE: ${MAVROUTER_NAME}
     volumes:
-      - ${RIG_DATA_DIR:?logging.enabled needs RIG_DATA_DIR}/mavlink-router/${MAVROUTER_NAME}:/var/log/mavlink-router
+      - ${RIG_DATA_DIR:?logging.enabled needs RIG_DATA_DIR}:/data

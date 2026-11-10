@@ -16,12 +16,19 @@
 #   mavlink-router-up configs/fcu.yaml config      # render the merged compose
 #   mavlink-router-up /any/host/path/fcu.yaml up -d    # config from anywhere (rig)
 #
+# rig's image-plan verbs (read-only: nothing is rendered, started or pulled):
+#   mavlink-router-up <config> images              # YAML list of the image refs `up` would run
+#   mavlink-router-up <config> runtime-images      # the same set as rig's version-1 JSON inventory
+# and when rig exports RIG_RUNTIME_IMAGE_PINS (a replay/simulation session), `up` starts exactly
+# the image IDs rig validated, never pulling — see tools/runtime_images.py.
+#
 # Multiple routers = run it per config; each is its own compose project, so instances never
 # collide (mind the host ports — network_mode: host). This repo does NOT depend on rig (one-way;
 # see rigging.yaml).
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${MAVROUTER_PYTHON:-python3}"
+COMPOSE="$REPO/docker/compose/compose.deploy.yaml"
 
 CONFIG="${1:?usage: mavlink-router-up <config.yaml> [up [-d]|down|status|logs|config|...]}"
 shift || true
@@ -33,25 +40,42 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-# config -> instance identity + derived tokens (SERVICE / NAME / TYPE / DEVICE / HEALTH_PORT /
-# LOGGING). Values are shell-quoted by the renderer, so the eval is safe for device paths.
-eval "$("$PYTHON" "$REPO/tools/render_conf.py" --env "$CONFIG_ABS" | sed 's/^/export /')"
-PROJECT="${SERVICE}_${NAME}"
+# Image-plan queries. The one image this service runs depends on the image env alone
+# (MAVROUTER_IMAGE / RIG_IMAGE_REGISTRY / RIG_IMAGE_TAG) — never on the instance config, and the
+# serial/logging overlays add no service — so the query reads the base compose with placeholders
+# and does not parse the config at all: rig plans a fleet artifact from configs whose per-vehicle
+# identity is still unresolved, and a query must not write the staged main.conf either.
+case "${1:-}" in
+  images|runtime-images)
+    export MAVROUTER_CONF_HOST=/dev/null MAVROUTER_CONF_SHA256=none
+    export MAVROUTER_NAME=image-plan MAVROUTER_HEALTH_PORT=0
+    export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-mavlink-router_image-plan}"
+    exec "$PYTHON" "$REPO/tools/runtime_images.py" "$1" -f "$COMPOSE"
+    ;;
+esac
 
-# Render the router config to a host staging path (one rendered file per instance).
-mkdir -p "$REPO/var/run"
-CONF_HOST="$REPO/var/run/${NAME}.conf"
-"$PYTHON" "$REPO/tools/render_conf.py" "$CONFIG_ABS" > "$CONF_HOST"
+# config -> validated instance identity + derived tokens (SERVICE / NAME / TYPE / DEVICE /
+# HEALTH_PORT / LOGGING), with the router config rendered to its host staging path (CONF_HOST, one
+# file per instance; CONF_SHA256 is its content hash). ONE renderer pass, captured before the
+# eval so a rejected config stops right here with the renderer's own message. Values are
+# shell-quoted by the renderer, so the eval is safe for device paths.
+TOKENS="$("$PYTHON" "$REPO/tools/render_conf.py" --stage "$REPO/var/run" "$CONFIG_ABS")"
+eval "$TOKENS"
+PROJECT="${SERVICE}_${NAME}"
 
 # Compose env: this instance's rendered config, name, and health port. The deploy image is
 # resolved by the compose file itself (MAVROUTER_IMAGE override -> RIG_IMAGE_REGISTRY -> local
 # mavlink_router:latest), so a standalone run needs no rig and no registry; export
-# MAVROUTER_IMAGE to force a specific image.
+# MAVROUTER_IMAGE to force a specific image. The content hash rides along as a container label:
+# compose only recreates a container whose DEFINITION changed, and an edited main.conf behind
+# the same mount path is not that — without the label `up` would leave the router running its
+# old config.
 export MAVROUTER_CONF_HOST="$CONF_HOST"
+export MAVROUTER_CONF_SHA256="$CONF_SHA256"
 export MAVROUTER_NAME="$NAME"
 export MAVROUTER_HEALTH_PORT="$HEALTH_PORT"
 
-FILES=(-f "$REPO/docker/compose/compose.deploy.yaml")
+FILES=(-f "$COMPOSE")
 if [ "$TYPE" = "serial" ]; then
   export MAVROUTER_DEVICE="${DEVICE:?serial config needs uart_endpoints[0].device}"
   FILES+=(-f "$REPO/docker/compose/compose.deploy.serial.yaml")
@@ -71,4 +95,9 @@ ARGS=("$@")
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$PROJECT}"
 
 echo "mavlink-router-up: project=$COMPOSE_PROJECT_NAME type=$TYPE conf=$CONF_HOST" >&2
+# A rig session pinned this instance's images (set, even if empty, means "pinned"): hand `up` to
+# the helper, which re-checks the active image set against the pins and starts the frozen model.
+if [ "${ARGS[0]}" = "up" ] && [ "${RIG_RUNTIME_IMAGE_PINS+x}" ]; then
+  exec "$PYTHON" "$REPO/tools/runtime_images.py" pinned-up "${FILES[@]}" -- "${ARGS[@]:1}"
+fi
 exec docker compose "${FILES[@]}" "${ARGS[@]}"

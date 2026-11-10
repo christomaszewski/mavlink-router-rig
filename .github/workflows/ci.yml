@@ -20,44 +20,55 @@ defaults:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build the runtime image FROM BOTH PINS — the gate that proves each pinned
-  # source (sources/upstream.repos AND sources/fork.repos) still fetches and
-  # compiles, so a fork rebase or an upstream bump can't silently break the
-  # other. No push: `rig build` (tools/build_image.sh) publishes; CI validates.
+  # Build the runtime image FROM BOTH PINS, natively on BOTH declared
+  # architectures (rigging.yaml build.architectures) — the gate that proves each
+  # pinned source (sources/upstream.repos AND sources/fork.repos) still fetches
+  # and compiles everywhere the fleet runs it, so a fork rebase or an upstream
+  # bump can't silently break the other. Built through tools/build_image.sh, the
+  # entrypoint `rig build` runs, then started for real: tools/smoke_test.sh
+  # drives launcher -> compose -> entrypoint -> router -> healthcheck.
+  # No push (PUSH=0): `rig build` publishes; CI validates.
   # ---------------------------------------------------------------------------
   build-image:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         source: [upstream, fork]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: resolve pin (${{ matrix.source }})
-        id: pin
+      - name: build (${{ matrix.source }}, native)
+        env:
+          MAVROUTER_SOURCE: ${{ matrix.source }}
+          PUSH: "0"
+        run: tools/build_image.sh ci "${{ matrix.source }}"
+      - name: image records its source
         run: |
           pin="sources/${{ matrix.source }}.repos"
-          echo "url=$(awk '$1 == "url:" {print $2}' "$pin")" >> "$GITHUB_OUTPUT"
-          echo "ref=$(awk '$1 == "version:" {print $2}' "$pin")" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.runtime
-          push: false
-          load: false
-          cache-from: type=gha,scope=${{ matrix.source }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.source }}
-          build-args: |
-            MAVROUTER_URL=${{ steps.pin.outputs.url }}
-            MAVROUTER_REF=${{ steps.pin.outputs.ref }}
+          want="$(awk '$1 == "url:" {print $2}' "$pin") $(awk '$1 == "version:" {print $2}' "$pin")"
+          got="$(docker image inspect "ci/mavlink_router:${{ matrix.source }}" --format \
+            '{{index .Config.Labels "org.opencontainers.image.source"}} {{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          echo "labels: $got"
+          [ "$got" = "$want" ]
+          docker run --rm "ci/mavlink_router:${{ matrix.source }}" --version
+      - name: PyYAML for the launcher
+        run: python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+      - name: smoke test (launcher -> container -> healthcheck)
+        env:
+          MAVROUTER_IMAGE: ci/mavlink_router:${{ matrix.source }}
+        run: tools/smoke_test.sh
 
   # ---------------------------------------------------------------------------
-  # rig launcher contract, executable (see rigging.yaml). `rig certify` runs
-  # `mavlink-router-up <config> config` under a poisoned fleet env and asserts
-  # the contract held: COMPOSE_PROJECT_NAME honored (no -p), image pulled from
-  # RIG_IMAGE_REGISTRY as :RIG_IMAGE_TAG (build/pull agreement), deterministic +
-  # name-derived output. Bare runner — needs docker compose + PyYAML, not ROS.
+  # rig's contracts, executable (see rigging.yaml), against rig's CURRENT main.
+  # `rig certify` runs `mavlink-router-up <config> config` under a poisoned
+  # fleet env and asserts the launcher contract held: COMPOSE_PROJECT_NAME
+  # honored (no -p), image pulled from RIG_IMAGE_REGISTRY as :RIG_IMAGE_TAG
+  # (build/pull agreement), the declared image override honored, deterministic +
+  # name-derived output. --require-build-check adds the portable build contract:
+  # tools/build_image.sh runs in a sandbox against a docker stub for every
+  # architecture set, cached and --no-cache. Bare runner — needs docker compose
+  # + PyYAML, not ROS.
   # ---------------------------------------------------------------------------
   certify:
     runs-on: ubuntu-latest
@@ -67,16 +78,36 @@ jobs:
         with:
           repository: christomaszewski/rig
           path: .rig
-      - run: python3 -m pip install --user pyyaml
-      - name: rig certify (launcher contract)
-        run: ./.rig/rig certify --repo . --config configs/mavlink-router.example.yaml
+      - run: python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+      - uses: ./.rig/.github/actions/setup-build-probe
+      - name: rig certify (launcher and portable build contracts)
+        run: ./.rig/rig certify --require-build-check --repo . --config configs/mavlink-router.example.yaml
+      # rig-build.sh is rig's helper, copied into each service's build context; nothing else
+      # keeps the copy current.
+      - name: tools/rig-build.sh is rig's canonical helper
+        run: cmp tools/rig-build.sh .rig/packaging/rig-build.sh
 
   # ---------------------------------------------------------------------------
-  # Shell hygiene on the deploy surface (launcher + build script + entrypoints).
+  # Unit tests: the config renderer (what it renders, refuses and stages), the
+  # pins that are written down more than once (sources/*.repos, rigging.yaml
+  # build.sources, the Dockerfile defaults), the build entrypoint against a
+  # docker stub, and the launcher's image-plan verbs.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+      - name: unit tests
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+
+  # ---------------------------------------------------------------------------
+  # Shell hygiene on the deploy surface (launcher + build scripts + entrypoints).
+  # -x: follow build_image.sh's `source` of rig-build.sh.
   # ---------------------------------------------------------------------------
   shellcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck launcher + build script + entrypoints
-        run: shellcheck mavlink-router-up tools/build_image.sh docker/entrypoints/*.sh
+      - name: shellcheck launcher + tools + entrypoints
+        run: shellcheck -x mavlink-router-up tools/*.sh docker/entrypoints/*.sh

@@ -1,4 +1,6 @@
-# rig service descriptor — how rig drives this repo's launcher (schema: bringup rig_cli/descriptor.py).
+# rig service descriptor — how rig drives this repo's launcher (schema: rig's rig_cli/descriptor.py
+# and rig_cli/build_contract.py; `rig certify --repo . --require-build-check` is the executable form).
+# Descriptive metadata ONLY — this repo does not depend on rig; rig depends on this repo (one-way).
 service: mavlink-router
 launcher: mavlink-router-up
 tier: infra                     # shared MAVLink hub — up before sensors/autonomy, down after
@@ -6,9 +8,16 @@ tier: infra                     # shared MAVLink hub — up before sensors/auton
 verbs:
   up: "up -d"
   down: "down"
-  status: "ps"
+  status: "ps"                  # rig appends `--format json` to parse `docker compose ps`
   logs: "logs"
   config: "config"
+  # Image planning (read-only; the launcher answers these itself, they are not compose
+  # subcommands). `images` prints a YAML list of the refs `up` would run — what a bundled fleet
+  # artifact needs before per-vehicle identity is resolved. `runtime-images` is the version-1
+  # JSON inventory a replay/simulation session asks for; the same launcher then honors
+  # RIG_RUNTIME_IMAGE_PINS at `up`, starting exactly the image IDs rig validated.
+  images: "images"
+  runtime-images: "runtime-images"
 
 examples:
   - configs/mavlink-router.example.yaml
@@ -16,17 +25,50 @@ examples:
 build:
   command: tools/build_image.sh
   images: [mavlink_router]
+  # One runtime-independent Linux image, shared by vehicle and replay targets.
+  architectures: [arm64, amd64]
+  capabilities: {no_cache: true, platforms: true}
+  # The git repos the image build would otherwise clone inside the builder. rig resolves each
+  # through its local mirror (`rig src sync`), exports the tree with submodules, and hands it to
+  # tools/build_image.sh as $RIG_BUILD_SOURCES/<name> — so `rig build --offline` works. BOTH pins
+  # are declared because MAVROUTER_SOURCE picks between them at build time. These repeat
+  # sources/<name>.repos (the pin the build script reads): bump the two together —
+  # tools/test_contract.py fails CI on a mismatch, and the build script refuses one at build time.
+  sources:
+    - name: upstream
+      repo: https://github.com/mavlink-router/mavlink-router.git
+      ref: 2362c620f483cef1edd574fb962a373a288e4b9e
+    - name: fork
+      repo: https://github.com/christomaszewski/mavlink-router.git
+      ref: 2fbf41b8587f4ad049333e7dafcb207bf7b77198
+images:
+  override_env: {mavlink_router: MAVROUTER_IMAGE}
 
+# Not started by `rig replay` unless a deployment asks for it (vehicle.yaml `replay.services`,
+# an instance row's `replay: {start: true}`, or --include-service). Infra is otherwise
+# auto-selected for every replay session, and this service is a link to LIVE hardware — the
+# flight controller's serial port, the GCS radio — with nothing recorded to play back: on a bench
+# its serial device is simply absent, and on the vehicle a replay has no business reopening the
+# FCU link. Still fully session-capable when selected (verbs.runtime-images above).
+replay:
+  start: false
+
+# Host-facing ports rig doctor checks for clashes across instances (host networking — ports are
+# shared vehicle-wide). Paths into the instance config; a `[key=value]` selector picks the FIRST
+# matching list entry, so a second server-mode UDP endpoint is still yours to keep uncollided.
 host_ports:
-  - "general.tcp_server_port"   # UDP endpoint ports are list-valued — rig doctor's dotted config
-                                # paths can't reach into lists; keep those uncollided by hand
+  - "general.tcp_server_port"
+  - "udp_endpoints[mode=server].port"
 
 launch_surface:
   - mavlink-router-up
   - tools/render_conf.py
+  - tools/runtime_images.py
   - docker/compose/compose.deploy.yaml
   - docker/compose/compose.deploy.serial.yaml
   - docker/compose/compose.deploy.logging.yaml
 
 # no ros_distro: not a ROS service (raw MAVLink over serial/UDP/TCP)
-# no external_volumes: nothing persists outside the optional RIG_DATA_DIR logging bind
+# no external_volumes: nothing lives in a named volume. With `logging.enabled` the flight logs go
+#   under RIG_DATA_DIR — <data>/current/mavlink-router/<name> in the open rig run, or the flat
+#   <data>/mavlink-router/<name> without a run registry (docker/compose/compose.deploy.logging.yaml).

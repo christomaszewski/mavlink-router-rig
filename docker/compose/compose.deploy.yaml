@@ -9,13 +9,19 @@
 services:
   router:
     # Image precedence (Docker Compose interpolation): MAVROUTER_IMAGE (a full per-service
-    # override, e.g. a local mavlink_router:dev) wins; else the rig-injected fleet policy —
-    # RIG_IMAGE_REGISTRY prefixed onto mavlink_router, pulled as :RIG_IMAGE_TAG (what `rig build`
-    # pushed); else the bare local mavlink_router:latest (default dev/standalone behavior).
+    # override, e.g. a local mavlink_router:dev — and the variable rig's build catalog injects a
+    # digest-pinned ref through, see rigging.yaml images.override_env) wins; else the rig-injected
+    # fleet policy — RIG_IMAGE_REGISTRY prefixed onto mavlink_router, pulled as :RIG_IMAGE_TAG
+    # (what `rig build` pushed); else the bare local mavlink_router:latest (dev/standalone).
     image: ${MAVROUTER_IMAGE:-${RIG_IMAGE_REGISTRY:+${RIG_IMAGE_REGISTRY}/}mavlink_router:${RIG_IMAGE_TAG:-latest}}
     network_mode: host          # UDP/TCP endpoints bind host ports directly (GCS link, autonomy,
                                 # telemetry radios); MAVLink peers expect the host's addresses
     restart: unless-stopped
+    labels:
+      # Content hash of the rendered main.conf below. The mount PATH never changes, so without
+      # this an edited config would not change the service definition and `up` would keep the
+      # running container — and its old routing config. A changed hash makes `up` recreate it.
+      mavlink-router-rig.conf-sha256: ${MAVROUTER_CONF_SHA256:-}
     environment:
       # the instance's TcpServerPort, so the baked healthcheck probes ITS port
       # (0 = TCP server disabled -> process-liveness fallback)

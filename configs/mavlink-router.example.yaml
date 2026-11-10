@@ -26,10 +26,12 @@ uart_endpoints:                 # the flight controller link. At most ONE (the s
     device: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0  # stable by-id path,
                                 # NOT /dev/ttyUSB0 (renumbering) and NOT by-path (colons break
                                 # the compose device mapping)
-    baud: 500000
+    baud: 500000                # or a list, e.g. [57600, 921600]: upstream cycles through the
+                                # rates until the link syncs
     # flow_control: false
 
-udp_endpoints:
+udp_endpoints:                  # addresses are IP literals (upstream resolves no hostnames);
+                                # IPv6 goes in brackets, lowercase: "[::1]"
   - name: gcs                   # ground station: it sends first (server mode = bind + learn peer)
     mode: server
     address: 0.0.0.0
@@ -46,13 +48,18 @@ udp_endpoints:
 #     retry_timeout: 5          # seconds between reconnect attempts (0 = no reconnect)
 
 # logging:                      # OPTIONAL flight-stack (.bin/.ulg) + telemetry (.tlog) logging.
-#   enabled: true               # adds the logging compose overlay -> RIG_DATA_DIR bind
+#   enabled: true               # adds the logging compose overlay (needs RIG_DATA_DIR). Logs land
+#                               # in the open rig run, $RIG_DATA_DIR/current/mavlink-router/<name>,
+#                               # or flat in $RIG_DATA_DIR/mavlink-router/<name> without one
 #   mode: while-armed           # always | while-armed
 #   telemetry: true             # also record raw .tlog (uses the same mode)
 #   max_log_files: 50           # retention — upstream defaults to UNLIMITED; set one of these
 #   min_free_space_mb: 512      # ... or free-space-driven deletion (MB, mapped to upstream bytes)
+#                               # (both act on the directory being written — under rig, the open
+#                               # run's; logs in sealed runs are never pruned)
 
-# Any endpoint may carry a `filters:` map, passed VERBATIM into main.conf — message/source
+# Any endpoint may carry a `filters:` map, passed through into main.conf — message/source
 # filtering and endpoint grouping (AllowMsgIdOut, BlockSrcSysIn, Group, ...; see upstream
-# examples/config.sample). Example: only HEARTBEAT+sys_status out to a bandwidth-poor radio:
+# examples/config.sample). Id filters take an integer or a list; Group takes a name.
+# Example: only HEARTBEAT+sys_status out to a bandwidth-poor radio:
 #   filters: {AllowMsgIdOut: [0, 1]}

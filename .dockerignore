@@ -1,6 +1,8 @@
 # Keep the Docker build context small + reproducible. The runtime image build needs only
-# docker/entrypoints/ (COPYed) — the build stage clones the pinned source itself (url/ref arrive
-# as build args from tools/build_image.sh), so never the host's vendored src/ nor any local state.
+# docker/entrypoints/ (COPYed) — the pinned source never comes from this context: the build stage
+# clones it (url/ref arrive as build args from tools/build_image.sh), or under rig receives the
+# tree rig exported as the separate `mavrouter-src` named context. So never the host's vendored
+# src/ nor any local state.
 .git/
 .github/
 .claude/

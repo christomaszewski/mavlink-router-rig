@@ -1,30 +1,56 @@
-# syntax=docker/dockerfile:1
 # Minimal production image for upstream mavlink-router, VENDORED AT BUILD TIME. Self-contained
-# two-stage build (modeled on upstream's examples/Dockerfile.alpine): the build stage clones the
+# two-stage build (modeled on upstream's examples/Dockerfile.alpine): the build stage obtains the
 # pinned source and compiles it (meson/ninja, release); the runtime stage ships only the
 # mavlink-routerd binary on alpine + libstdc++.
 #
+# NO `# syntax=` directive, on purpose: naming a frontend image makes every build — a fully
+# cached one included — resolve it on Docker Hub, which is exactly what `rig build --offline`
+# cannot do. Everything used here (multi-stage, RUN --mount=type=bind,from=<stage>) is in the
+# frontend built into BuildKit.
+#
 # MAVROUTER_URL / MAVROUTER_REF come from tools/build_image.sh, which resolves them from
 # sources/<source>.repos (MAVROUTER_SOURCE=upstream|fork, default in sources/DEFAULT). The
-# defaults below mirror sources/upstream.repos so a bare
+# defaults below mirror sources/upstream.repos (tools/test_contract.py holds them to it) so a bare
 #   docker build -f docker/Dockerfile.runtime -t mavlink_router:latest .
-# still builds the pinned upstream.
+# still builds the pinned upstream — whatever sources/DEFAULT says; only the build script reads it.
 ARG MAVROUTER_URL=https://github.com/mavlink-router/mavlink-router.git
 ARG MAVROUTER_REF=2362c620f483cef1edd574fb962a373a288e4b9e
+
+# ---- source stage -----------------------------------------------------------
+# Empty by default: the build stage then clones MAVROUTER_URL at MAVROUTER_REF itself. Under rig,
+# tools/build_image.sh passes `--build-context mavrouter-src=$RIG_BUILD_SOURCES/<source>`, which
+# REPLACES this stage with the pinned tree rig exported from its local git mirror (submodules
+# included, no .git) — the build then never touches a git remote, so it also works offline.
+FROM scratch AS mavrouter-src
 
 # ---- build stage ------------------------------------------------------------
 FROM alpine:3 AS build
 ARG MAVROUTER_URL
 ARG MAVROUTER_REF
-RUN apk add --no-cache gcc g++ git pkgconf meson ninja linux-headers
+# bash: upstream's tools/meson-vcs-tag.sh (the --version stamp) is a bash script.
+RUN apk add --no-cache bash gcc g++ git pkgconf meson ninja linux-headers
 
 WORKDIR /workspace
-# Full clone (not shallow): upstream's tools/meson-vcs-tag.sh embeds `git describe` into the
-# binary's --version output, which needs tag history; the repo is small. The mavlink C library
-# submodule is REQUIRED — the tree does not compile without it.
-RUN git clone "${MAVROUTER_URL}" src \
- && git -C src checkout --detach "${MAVROUTER_REF}" \
- && git -C src submodule update --init --recursive
+# Clone path — full clone (not shallow): upstream's tools/meson-vcs-tag.sh embeds `git describe`
+# into the binary's --version output, which needs tag history; the repo is small.
+# Exported-tree path — there is no .git to describe, and upstream's script would stamp the
+# literal "VERSION", so the stamp script is replaced by one that prints the pinned ref (the
+# first 12 characters: a short SHA for a SHA pin, the tag itself for a tag pin). That script
+# only feeds the version string; no router source is touched on either path.
+# The mavlink C library submodule is REQUIRED either way — the tree does not compile without it.
+RUN --mount=type=bind,from=mavrouter-src,target=/mnt/mavrouter-src \
+    if [ -f /mnt/mavrouter-src/meson.build ]; then \
+      cp -a /mnt/mavrouter-src src \
+      && printf '#!/bin/sh\necho "%.12s"\n' "${MAVROUTER_REF}" > src/tools/meson-vcs-tag.sh \
+      && chmod +x src/tools/meson-vcs-tag.sh; \
+    else \
+      git clone "${MAVROUTER_URL}" src \
+      && git -C src checkout --detach "${MAVROUTER_REF}" \
+      && git -C src submodule update --init --recursive; \
+    fi \
+ && if [ ! -f src/modules/mavlink_c_library_v2/ardupilotmega/mavlink.h ]; then \
+      echo "ERROR: the mavlink_c_library_v2 submodule is missing from the source tree" >&2; exit 1; \
+    fi
 
 # -Dsystemdsystemunitdir: 'auto' asks pkg-config for systemd, absent on alpine — pin the path so
 # configure succeeds (nothing is installed there; we only ship the binary).
@@ -50,9 +76,8 @@ RUN gaps="$(ldd /usr/bin/mavlink-routerd | grep 'not found' || true)" \
     fi \
  && (/usr/bin/mavlink-routerd --version || true)
 
-COPY docker/entrypoints/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY docker/entrypoints/healthcheck.sh /usr/local/bin/healthcheck.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
+COPY --chmod=0755 docker/entrypoints/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 docker/entrypoints/healthcheck.sh /usr/local/bin/healthcheck.sh
 
 # Provenance: which source (upstream vs fork) and which exact rev this image was built from —
 # `docker image inspect` answers "what is this vehicle actually running?".
