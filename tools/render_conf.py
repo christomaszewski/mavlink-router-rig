@@ -19,7 +19,7 @@ DERIVED onto upstream's INI schema ([General] + one section per endpoint); an en
 `mavlink-router-up`:
 
   render_conf.py <config.yaml>                # -> main.conf INI on stdout
-  render_conf.py --env <config.yaml>          # -> SERVICE/NAME/TYPE/DEVICE/... env lines (eval'd)
+  render_conf.py --env <config.yaml>          # -> SERVICE/NAME/TYPE/DEVICE*/... env lines (eval'd)
   render_conf.py --stage <dir> <config.yaml>  # -> write <dir>/<name>.conf, then the env lines plus
                                               #    CONF_HOST (that file) and CONF_SHA256 (its content)
 
@@ -76,6 +76,27 @@ _FILTER_KEYS = {
     "Group": None,
 }
 _FILTER_CANON = {k.lower(): k for k in _FILTER_KEYS}
+
+# Every key the rig config accepts, per block. tests/unit holds the example config to this list:
+# an option added here must be documented there.
+_TOP_KEYS = {"service", "name", "general", "uart_endpoints", "udp_endpoints", "tcp_endpoints",
+             "logging"}
+_GENERAL_KEYS = {"tcp_server_port", "report_stats", "debug_log_level", "dedup_period_ms",
+                 "mavlink_dialect", "sniffer_sysid"}
+_LOGGING_KEYS = {"enabled", "mode", "telemetry", "log_system_id", "max_log_files",
+                 "min_free_space_mb"}
+_UART_KEYS = {"name", "device", "baud", "flow_control", "tx_queue_size", "filters"}
+_UDP_KEYS = {"name", "mode", "address", "port", "tx_queue_size", "filters"}
+_TCP_KEYS = {"name", "address", "port", "retry_timeout", "tx_queue_size", "filters"}
+
+# The serial compose overlays carry one device each — compose.deploy.serial.yaml for the first
+# UART, compose.deploy.serial<N>.yaml for the Nth — so the number of UART endpoints is bounded by
+# the overlay files that exist. Raising it means adding an overlay (and its launch_surface row).
+_MAX_UARTS = 4
+
+# The fork's per-endpoint transmit queue (TxQueueSize), in bytes: its own accepted range. The
+# upstream build has no such key and ignores it; the image's entrypoint says so at start.
+_TX_QUEUE_MIN, _TX_QUEUE_MAX = 280, 1048576
 
 # Container-side root of the logging overlay's RIG_DATA_DIR bind (compose.deploy.logging.yaml).
 # The rendered `Log =` is the FLAT layout under it; the image's entrypoint re-points the router at
@@ -183,20 +204,24 @@ def parse_filters(where: str, endpoint: dict) -> list:
     return out
 
 
+def tx_queue(where: str, endpoint: dict) -> list:
+    """An endpoint's optional `tx_queue_size:` -> [("TxQueueSize", text)] or []."""
+    if "tx_queue_size" not in endpoint:
+        return []
+    size = want_int(f"{where}: tx_queue_size", endpoint["tx_queue_size"],
+                    _TX_QUEUE_MIN, _TX_QUEUE_MAX)
+    return [("TxQueueSize", str(size))]
+
+
 def parse(cfg: dict) -> dict:
     """Validate the whole config -> a normalized model every output mode renders from. Each
     section is an ordered list of (IniKey, text) pairs holding ONLY the keys the user set."""
-    reject_unknown("top-level", cfg, {
-        "service", "name", "general", "uart_endpoints", "udp_endpoints", "tcp_endpoints", "logging",
-    })
+    reject_unknown("top-level", cfg, _TOP_KEYS)
     service = require_ident("service", cfg.get("service") or "mavlink-router", _SERVICE_RE)
     name = require_ident("name", cfg.get("name") or "main")
 
     general = mapping("general", cfg.get("general"))
-    reject_unknown("general", general, {
-        "tcp_server_port", "report_stats", "debug_log_level", "dedup_period_ms",
-        "mavlink_dialect", "sniffer_sysid",
-    })
+    reject_unknown("general", general, _GENERAL_KEYS)
     lines = []
     tcp_server_port = 5760  # upstream's default when omitted
     if "tcp_server_port" in general:
@@ -219,9 +244,7 @@ def parse(cfg: dict) -> dict:
                       str(want_int("general.sniffer_sysid", general["sniffer_sysid"], 0, 255))))
 
     logging_blk = mapping("logging", cfg.get("logging"))
-    reject_unknown("logging", logging_blk, {
-        "enabled", "mode", "telemetry", "log_system_id", "max_log_files", "min_free_space_mb",
-    })
+    reject_unknown("logging", logging_blk, _LOGGING_KEYS)
     log_enabled = want_bool("logging.enabled", logging_blk.get("enabled", False))
     # Validated even when disabled: a bad value must not lie dormant until someone flips `enabled`.
     log_lines = [("Log", f"{_DATA_ROOT}/{_DATA_KIND}/{name}")]
@@ -248,12 +271,12 @@ def parse(cfg: dict) -> dict:
         if value is not None and not isinstance(value, list):
             die(f"`{kind}:` must be a list")
         raw[kind] = value or []
-    # ONE serial slot: the compose serial overlay passes exactly one device through. A second UART
-    # needs a second overlay slot — extend deliberately, do not silently drop a device.
-    if len(raw["uart_endpoints"]) > 1:
-        die("at most one UART endpoint is supported (the serial overlay carries one device)")
+    # One fixed compose overlay per serial device — never silently drop one.
+    if len(raw["uart_endpoints"]) > _MAX_UARTS:
+        die(f"at most {_MAX_UARTS} UART endpoints are supported (one serial compose overlay per "
+            "device; run a second instance for more)")
 
-    sections, seen_names, device = [], set(), ""
+    sections, seen_names, devices = [], set(), []
 
     def begin(kind: str, endpoint, known) -> str:
         if not isinstance(endpoint, dict):
@@ -267,7 +290,7 @@ def parse(cfg: dict) -> dict:
         return ep_name
 
     for endpoint in raw["uart_endpoints"]:
-        ep = begin("uart", endpoint, {"name", "device", "baud", "flow_control", "filters"})
+        ep = begin("uart", endpoint, _UART_KEYS)
         where = f"uart endpoint {ep!r}"
         device = endpoint.get("device")
         if not isinstance(device, str) or not device.startswith("/"):
@@ -277,6 +300,9 @@ def parse(cfg: dict) -> dict:
             die(f"{where}: device path {device!r} contains ':', whitespace or a control "
                 "character — it breaks the compose device mapping; use the "
                 "/dev/serial/by-id/... form (not by-path)")
+        if device in devices:
+            die(f"{where}: device {device} is already used by another UART endpoint")
+        devices.append(device)
         body = [("Device", device)]
         if "baud" in endpoint:  # a list = upstream cycles through the rates until one syncs
             bauds = want_ids(f"{where}: baud", endpoint["baud"], _UINT32)
@@ -286,10 +312,11 @@ def parse(cfg: dict) -> dict:
         if "flow_control" in endpoint:
             body.append(("FlowControl",
                          _bool(want_bool(f"{where}: flow_control", endpoint["flow_control"]))))
-        sections.append((f"UartEndpoint {ep}", body + parse_filters(where, endpoint)))
+        sections.append((f"UartEndpoint {ep}",
+                         body + tx_queue(where, endpoint) + parse_filters(where, endpoint)))
 
     for endpoint in raw["udp_endpoints"]:
-        ep = begin("udp", endpoint, {"name", "mode", "address", "port", "filters"})
+        ep = begin("udp", endpoint, _UDP_KEYS)
         where = f"udp endpoint {ep!r}"
         mode = endpoint.get("mode")
         if mode not in _UDP_MODES:
@@ -300,10 +327,11 @@ def parse(cfg: dict) -> dict:
             body.append(("Port", str(want_port(f"{where}: port", endpoint["port"]))))
         elif mode == "server":  # normal mode without a port: upstream picks the next free 14550+
             die(f"{where}: server mode requires `port:`")
-        sections.append((f"UdpEndpoint {ep}", body + parse_filters(where, endpoint)))
+        sections.append((f"UdpEndpoint {ep}",
+                         body + tx_queue(where, endpoint) + parse_filters(where, endpoint)))
 
     for endpoint in raw["tcp_endpoints"]:
-        ep = begin("tcp", endpoint, {"name", "address", "port", "retry_timeout", "filters"})
+        ep = begin("tcp", endpoint, _TCP_KEYS)
         where = f"tcp endpoint {ep!r}"
         if "port" not in endpoint:
             die(f"{where}: `port:` is required")
@@ -312,7 +340,8 @@ def parse(cfg: dict) -> dict:
         if "retry_timeout" in endpoint:  # seconds; 0 = never reconnect
             body.append(("RetryTimeout", str(want_int(f"{where}: retry_timeout",
                                                       endpoint["retry_timeout"], 0))))
-        sections.append((f"TcpEndpoint {ep}", body + parse_filters(where, endpoint)))
+        sections.append((f"TcpEndpoint {ep}",
+                         body + tx_queue(where, endpoint) + parse_filters(where, endpoint)))
 
     if not sections and tcp_server_port == 0:
         die("nothing to route: no endpoints and the TCP server is disabled")
@@ -320,7 +349,7 @@ def parse(cfg: dict) -> dict:
     return {
         "service": service, "name": name, "general": lines, "sections": sections,
         "tcp_server_port": tcp_server_port, "log_enabled": log_enabled,
-        "serial": bool(raw["uart_endpoints"]), "device": device or "",
+        "devices": devices,
     }
 
 
@@ -345,11 +374,14 @@ def render_ini(model: dict) -> str:
 def render_env(model: dict, extra=()) -> str:
     """The launcher's identity/derived tokens, shell-quoted for a safe `eval` (device paths may
     contain characters an unquoted eval would mangle)."""
+    devices = model["devices"] + [""] * (_MAX_UARTS - len(model["devices"]))
     tokens = [
         ("SERVICE", model["service"]),
         ("NAME", model["name"]),
-        ("TYPE", "serial" if model["serial"] else "net"),
-        ("DEVICE", model["device"]),
+        ("TYPE", "serial" if model["devices"] else "net"),
+        # one token per serial overlay slot, in uart_endpoints order: DEVICE, DEVICE_2, ...
+        *((f"DEVICE_{slot}" if slot > 1 else "DEVICE", device)
+          for slot, device in enumerate(devices, start=1)),
         ("HEALTH_PORT", str(model["tcp_server_port"])),
         ("LOGGING", "1" if model["log_enabled"] else "0"),
         *extra,

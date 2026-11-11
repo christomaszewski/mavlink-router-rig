@@ -22,3 +22,6 @@ __pycache__/
 
 # Local tooling state (Claude Code, etc.)
 .claude/
+
+# A rig checkout for CI / the deployment tests (RIG_CLI=.rig/rig)
+/.rig/

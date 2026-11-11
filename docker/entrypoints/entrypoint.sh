@@ -10,6 +10,13 @@ set -eu
 
 if [ -f /etc/mavlink-router/main.conf ]; then
   set -- -c /etc/mavlink-router/main.conf "$@"
+  # TxQueueSize (the rig config's tx_queue_size) exists only in the fork build. The upstream
+  # parser skips keys it does not know without a word, so say it here instead of letting an
+  # operator believe the queue was sized. The key name is a literal in a binary that supports it.
+  if grep -qi '^TxQueueSize[ =]' /etc/mavlink-router/main.conf \
+     && ! grep -q TxQueueSize /usr/bin/mavlink-routerd; then
+    echo "entrypoint: WARNING — main.conf sets TxQueueSize (tx_queue_size), which this build of mavlink-router does not support: it is IGNORED. Use an image built from the fork pin (MAVROUTER_SOURCE=fork)." >&2
+  fi
 fi
 
 # Flight logging under rig. The logging compose overlay binds the fleet data dir at /data and

@@ -26,7 +26,10 @@ jobs:
   # and compiles everywhere the fleet runs it, so a fork rebase or an upstream
   # bump can't silently break the other. Built through tools/build_image.sh, the
   # entrypoint `rig build` runs, then started for real: tools/smoke_test.sh
-  # drives launcher -> compose -> entrypoint -> router -> healthcheck.
+  # drives launcher -> compose -> entrypoint -> router -> healthcheck, and
+  # tests/functional puts MAVLink peers on a deployed router (routing, filters,
+  # flight logs, serial, lifecycle) and deploys it through rig's CURRENT main
+  # (init/add/doctor/up/status/logs/down/vendor against throwaway deployments).
   # No push (PUSH=0): `rig build` publishes; CI validates.
   # ---------------------------------------------------------------------------
   build-image:
@@ -58,6 +61,15 @@ jobs:
         env:
           MAVROUTER_IMAGE: ci/mavlink_router:${{ matrix.source }}
         run: tools/smoke_test.sh
+      - uses: actions/checkout@v4
+        with:
+          repository: christomaszewski/rig
+          path: .rig
+      - name: functional tests (MAVLink peers on a deployed router; deployments through rig)
+        env:
+          MAVROUTER_IMAGE: ci/mavlink_router:${{ matrix.source }}
+          RIG_CLI: ${{ github.workspace }}/.rig/rig
+        run: python3 -m unittest discover -s tests/functional -v
 
   # ---------------------------------------------------------------------------
   # rig's contracts, executable (see rigging.yaml), against rig's CURRENT main.
@@ -81,17 +93,18 @@ jobs:
       - run: python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
       - uses: ./.rig/.github/actions/setup-build-probe
       - name: rig certify (launcher and portable build contracts)
-        run: ./.rig/rig certify --require-build-check --repo . --config configs/mavlink-router.example.yaml
+        run: ./.rig/rig certify --require-build-check --repo . --config config/mavlink-router.example.yaml
       # rig-build.sh is rig's helper, copied into each service's build context; nothing else
       # keeps the copy current.
       - name: tools/rig-build.sh is rig's canonical helper
         run: cmp tools/rig-build.sh .rig/packaging/rig-build.sh
 
   # ---------------------------------------------------------------------------
-  # Unit tests: the config renderer (what it renders, refuses and stages), the
-  # pins that are written down more than once (sources/*.repos, rigging.yaml
-  # build.sources, the Dockerfile defaults), the build entrypoint against a
-  # docker stub, and the launcher's image-plan verbs.
+  # Unit tests: the config renderer (what it renders, refuses and stages), that
+  # the example config documents every key, the pins that are written down more
+  # than once (sources/*.repos, rigging.yaml build.sources, the Dockerfile
+  # defaults), the build entrypoint against a docker stub, the launcher's
+  # image-plan verbs, and the compose model `up` would run.
   # ---------------------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
@@ -99,7 +112,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
       - name: unit tests
-        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+        run: python3 -m unittest discover -s tests/unit -v
 
   # ---------------------------------------------------------------------------
   # Shell hygiene on the deploy surface (launcher + build scripts + entrypoints).

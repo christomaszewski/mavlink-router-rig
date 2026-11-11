@@ -20,7 +20,7 @@ verbs:
   runtime-images: "runtime-images"
 
 examples:
-  - configs/mavlink-router.example.yaml
+  - config/mavlink-router.example.yaml
 
 build:
   command: tools/build_image.sh
@@ -66,6 +66,9 @@ launch_surface:
   - tools/runtime_images.py
   - docker/compose/compose.deploy.yaml
   - docker/compose/compose.deploy.serial.yaml
+  - docker/compose/compose.deploy.serial2.yaml
+  - docker/compose/compose.deploy.serial3.yaml
+  - docker/compose/compose.deploy.serial4.yaml
   - docker/compose/compose.deploy.logging.yaml
 
 # no ros_distro: not a ROS service (raw MAVLink over serial/UDP/TCP)

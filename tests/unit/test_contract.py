@@ -6,11 +6,12 @@ are written down more than once agree, the launch surface is complete, the build
 turns rig's build env into the right docker invocations, and the launcher's image-plan verbs
 answer in the shapes rig parses.
 
-    python3 -m unittest discover -s tools -p 'test_*.py' -v
+    python3 -m unittest discover -s tests/unit -v
 
 (`rig certify --repo . --require-build-check` is the other half — rig's own view of the same
 contract; CI runs both.)
 """
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ import unittest
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 RIGGING = yaml.safe_load((ROOT / "rigging.yaml").read_text())
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = "sha256:" + "a" * 64
@@ -38,6 +39,13 @@ if "--metadata-file" in args:
     with open(args[args.index("--metadata-file") + 1], "w") as meta:
         json.dump({{"containerimage.digest": "{DIGEST}"}}, meta)
 """
+
+
+def load_renderer():
+    spec = importlib.util.spec_from_file_location("render_conf", ROOT / "tools" / "render_conf.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def pin(name):
@@ -90,8 +98,17 @@ class DescriptorTests(unittest.TestCase):
         self.assertTrue(os.access(ROOT / RIGGING["build"]["command"], os.X_OK))
         # Everything the launcher reaches for at run time must be vendored with it.
         launcher = (ROOT / RIGGING["launcher"]).read_text()
-        referenced = set(re.findall(r'\$REPO/((?:docker|tools)/[\w./-]+)', launcher))
+        referenced = set()
+        for path, templated in re.findall(r'\$REPO/((?:docker|tools)/[\w./-]+)(\$slot[\w./-]*)?',
+                                          launcher):
+            if templated:  # compose.deploy.serial$slot.yaml: one overlay per further UART
+                slots = re.search(r"for slot in ([\d ]+);", launcher).group(1).split()
+                referenced |= {path + templated.replace("$slot", slot) for slot in slots}
+            else:
+                referenced.add(path)
         self.assertTrue(referenced)
+        self.assertEqual(len([rel for rel in referenced if "serial" in rel]),
+                         load_renderer()._MAX_UARTS, "one serial overlay per supported UART")
         self.assertLessEqual(referenced, set(surface), "launcher uses files outside launch_surface")
         # ...and the build context must never ride along onto the vehicle.
         self.assertFalse([rel for rel in surface if "Dockerfile" in rel or "build" in rel])
@@ -258,11 +275,14 @@ class BuildScriptTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
-@unittest.skipUnless(shutil.which("docker") and subprocess.run(
-    ["docker", "compose", "version"], capture_output=True).returncode == 0,
-    "needs the docker compose plugin (client-side render only; no daemon)")
-class ImagePlanTests(unittest.TestCase):
-    """`images` / `runtime-images`: the shapes rig parses, with nothing rendered or started."""
+HAVE_COMPOSE = bool(shutil.which("docker")) and subprocess.run(
+    ["docker", "compose", "version"], capture_output=True).returncode == 0
+NEEDS_COMPOSE = "needs the docker compose plugin (client-side render only; no daemon)"
+
+
+class SurfaceCase(unittest.TestCase):
+    """The launcher run from a scratch copy of exactly the declared launch surface — what a
+    vendored deployment has — with a clean environment."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -274,17 +294,28 @@ class ImagePlanTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / rel, target)
         self.config = self.root / "fleet.yaml"
-        # per-vehicle identity still unresolved, as in rig's templated-artifact image plan
-        self.config.write_text("service: mavlink-router\nname: fcu\n"
-                               "udp_endpoints:\n  - {name: gcs, mode: normal,"
-                               " address: '10.160.{{vehicle_id}}.80', port: 14550}\n")
         keep = ("PATH", "HOME", "TMPDIR", "DOCKER_CONFIG", "DOCKER_HOST", "DOCKER_CONTEXT")
         self.env = {k: v for k, v in os.environ.items() if k in keep}
         self.env["MAVROUTER_PYTHON"] = sys.executable
 
+    def launch(self, *verb, **env):
+        return subprocess.run([str(self.repo / "mavlink-router-up"), str(self.config), *verb],
+                              env={**self.env, **env}, capture_output=True, text=True)
+
+
+@unittest.skipUnless(HAVE_COMPOSE, NEEDS_COMPOSE)
+class ImagePlanTests(SurfaceCase):
+    """`images` / `runtime-images`: the shapes rig parses, with nothing rendered or started."""
+
+    def setUp(self):
+        super().setUp()
+        # per-vehicle identity still unresolved, as in rig's templated-artifact image plan
+        self.config.write_text("service: mavlink-router\nname: fcu\n"
+                               "udp_endpoints:\n  - {name: gcs, mode: normal,"
+                               " address: '10.160.{{vehicle_id}}.80', port: 14550}\n")
+
     def query(self, verb, **env):
-        result = subprocess.run([str(self.repo / "mavlink-router-up"), str(self.config), verb],
-                                env={**self.env, **env}, capture_output=True, text=True)
+        result = self.launch(verb, **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.repo / "var").exists(), "an image query must not stage anything")
         return result.stdout
@@ -312,11 +343,110 @@ class ImagePlanTests(unittest.TestCase):
         self.config.write_text("name: fcu\nudp_endpoints:\n"
                                "  - {name: gcs, mode: normal, address: 127.0.0.1, port: 14550}\n")
         pins = json.dumps({"version": 1, "images": {"some/other:image": DIGEST}})
-        result = subprocess.run(
-            [str(self.repo / "mavlink-router-up"), str(self.config), "up", "-d"],
-            env={**self.env, "RIG_RUNTIME_IMAGE_PINS": pins}, capture_output=True, text=True)
+        result = self.launch("up", "-d", RIG_RUNTIME_IMAGE_PINS=pins)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("runtime image selection changed", result.stderr)
+
+
+@unittest.skipUnless(HAVE_COMPOSE, NEEDS_COMPOSE)
+class ComposeModelTests(SurfaceCase):
+    """What `up` would hand to Docker for a given config: the merged compose model, rendered
+    client-side by `mavlink-router-up <config> config`."""
+
+    def model(self, text, **env):
+        self.config.write_text(text)
+        result = self.launch("config", "--format", "json", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        model = json.loads(result.stdout)
+        self.assertEqual(list(model["services"]), ["router"])
+        return model, model["services"]["router"]
+
+    NET = ("name: bench\ngeneral: {tcp_server_port: 5790}\n"
+           "udp_endpoints: [{name: gcs, mode: server, address: 0.0.0.0, port: 14550}]\n")
+
+    def test_network_only_instance(self):
+        model, router = self.model(self.NET)
+        self.assertEqual(model["name"], "mavlink-router_bench")
+        self.assertEqual(router["image"], "mavlink_router:latest")
+        self.assertEqual(router["network_mode"], "host")
+        self.assertEqual(router["restart"], "unless-stopped")
+        self.assertEqual(router["environment"], {"MAVROUTER_HEALTH_PORT": "5790"})
+        self.assertNotIn("devices", router)
+        self.assertNotIn("group_add", router)
+        self.assertNotIn("container_name", router)
+        staged = self.repo / "var" / "run" / "bench.conf"
+        (mount,) = router["volumes"]
+        self.assertEqual((mount["type"], mount["source"], mount["target"], mount.get("read_only")),
+                         ("bind", str(staged), "/etc/mavlink-router/main.conf", True))
+        self.assertIn("Port = 14550", staged.read_text())
+        import hashlib
+        self.assertEqual(router["labels"]["mavlink-router-rig.conf-sha256"],
+                         hashlib.sha256(staged.read_bytes()).hexdigest())
+
+    def test_project_name_and_image_follow_the_fleet_env(self):
+        model, router = self.model(self.NET, COMPOSE_PROJECT_NAME="bench-vehicle-7",
+                                   RIG_IMAGE_REGISTRY="reg.example:5000", RIG_IMAGE_TAG="v9")
+        self.assertEqual(model["name"], "bench-vehicle-7")
+        self.assertEqual(router["image"], "reg.example:5000/mavlink_router:v9")
+        _, router = self.model(self.NET, MAVROUTER_IMAGE="local/dev:1",
+                               RIG_IMAGE_REGISTRY="reg.example:5000", RIG_IMAGE_TAG="v9")
+        self.assertEqual(router["image"], "local/dev:1")
+
+    def test_disabled_tcp_server_switches_the_health_probe(self):
+        _, router = self.model(self.NET.replace("5790", "0"))
+        self.assertEqual(router["environment"]["MAVROUTER_HEALTH_PORT"], "0")
+
+    def test_example_config_passes_its_serial_device_through(self):
+        device = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0"
+        _, router = self.model((ROOT / RIGGING["examples"][0]).read_text())
+        self.assertEqual([(d["source"], d["target"]) for d in router["devices"]],
+                         [(device, device)])
+        self.assertEqual(router["group_add"], ["dialout"])
+        self.assertEqual(len(router["volumes"]), 1, "no data bind unless logging is enabled")
+
+    def test_every_uart_is_passed_through_in_order(self):
+        devices = ["/dev/ttyTHS1", "/dev/serial/by-id/usb-radio-if00", "/dev/ttyUSB7",
+                   "/dev/ttyACM0"]
+        rows = "".join(f"  - {{name: u{n}, device: {path}}}\n" for n, path in enumerate(devices))
+        for count in (2, 3, 4):
+            _, router = self.model("name: multi\nuart_endpoints:\n"
+                                   + "".join(rows.splitlines(keepends=True)[:count]))
+            self.assertEqual([(d["source"], d["target"]) for d in router["devices"]],
+                             [(path, path) for path in devices[:count]])
+            self.assertEqual(router["group_add"], ["dialout"])
+            conf = (self.repo / "var" / "run" / "multi.conf").read_text()
+            self.assertEqual(conf.count("[UartEndpoint "), count)
+
+    def test_logging_binds_the_data_dir_and_names_the_instance(self):
+        text = self.NET + "logging: {enabled: true, telemetry: true}\n"
+        data = self.root / "data"
+        _, router = self.model(text, RIG_DATA_DIR=str(data))
+        self.assertEqual(router["environment"], {"MAVROUTER_HEALTH_PORT": "5790",
+                                                 "MAVROUTER_LOG_INSTANCE": "bench"})
+        binds = {mount["target"]: mount["source"] for mount in router["volumes"]}
+        self.assertEqual(binds["/data"], str(data))
+        conf = (self.repo / "var" / "run" / "bench.conf").read_text()
+        self.assertIn("Log = /data/mavlink-router/bench\n", conf)
+        self.assertNotIn(str(data), json.dumps(router["labels"]))
+
+    def test_logging_without_a_data_dir_is_refused_by_name(self):
+        self.config.write_text(self.NET + "logging: {enabled: true}\n")
+        result = self.launch("config")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RIG_DATA_DIR", result.stderr)
+
+    def test_a_rejected_config_stops_before_compose(self):
+        self.config.write_text("name: bench\ngeneral: {tcp_server_prot: 1}\n")
+        result = self.launch("up", "-d")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip().splitlines()[-1].split(":")[0], "render_conf")
+        self.assertFalse((self.repo / "var").exists())
+
+    def test_status_is_compose_ps(self):
+        self.config.write_text(self.NET)
+        result = self.launch("status", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker compose ps", result.stdout)
 
 
 if __name__ == "__main__":

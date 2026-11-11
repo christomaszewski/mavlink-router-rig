@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """render_conf.py: what it renders, what it refuses, and how it stages the result.
 
-    python3 -m unittest discover -s tools -p 'test_*.py' -v
+    python3 -m unittest discover -s tests/unit -v
 """
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -15,9 +17,16 @@ import tempfile
 import textwrap
 import unittest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 RENDER = ROOT / "tools" / "render_conf.py"
-EXAMPLE = ROOT / "configs" / "mavlink-router.example.yaml"
+EXAMPLE = ROOT / "config" / "mavlink-router.example.yaml"
+
+
+def load_renderer():
+    spec = importlib.util.spec_from_file_location("render_conf", RENDER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class RenderCase(unittest.TestCase):
@@ -97,17 +106,20 @@ class RenderTests(RenderCase):
               max_log_files: 50
               min_free_space_mb: 512
             uart_endpoints:
-              - {name: fcu, device: /dev/ttyTHS1, baud: [57600, 921600], flow_control: true}
+              - {name: fcu, device: /dev/ttyTHS1, baud: [57600, 921600], flow_control: true,
+                 tx_queue_size: 280}
+              - {name: sik, device: /dev/ttyUSB0, baud: 57600}
             udp_endpoints:
               - {name: auto, mode: normal, address: "[::1]"}
               - name: radio
                 mode: server
                 address: 0.0.0.0
                 port: 14550
+                tx_queue_size: 65536
                 filters: {allowmsgidout: [0, 1], BlockSrcSysIn: 255, Group: radios}
             tcp_endpoints:
               - {name: cloud, address: 192.168.1.20, port: 5761, retry_timeout: 0,
-                 filters: {AllowSrcCompOut: "1, 190", Group: 2}}
+                 tx_queue_size: 1048576, filters: {AllowSrcCompOut: "1, 190", Group: 2}}
             """)
         self.assertEqual(out, textwrap.dedent("""\
             # rendered by render_conf.py for instance 'full' — edit the rig config, not this file
@@ -130,6 +142,11 @@ class RenderTests(RenderCase):
             Device = /dev/ttyTHS1
             Baud = 57600,921600
             FlowControl = true
+            TxQueueSize = 280
+
+            [UartEndpoint sik]
+            Device = /dev/ttyUSB0
+            Baud = 57600
 
             [UdpEndpoint auto]
             Mode = Normal
@@ -139,6 +156,7 @@ class RenderTests(RenderCase):
             Mode = Server
             Address = 0.0.0.0
             Port = 14550
+            TxQueueSize = 65536
             AllowMsgIdOut = 0,1
             BlockSrcSysIn = 255
             Group = radios
@@ -147,9 +165,40 @@ class RenderTests(RenderCase):
             Address = 192.168.1.20
             Port = 5761
             RetryTimeout = 0
+            TxQueueSize = 1048576
             AllowSrcCompOut = 1,190
             Group = 2
             """))
+
+    def test_every_filter_key(self):
+        """All twelve id filters and Group, on each endpoint kind, in upstream's own casing."""
+        filters = {key: [1, 2] for key in load_renderer()._FILTER_KEYS if key != "Group"}
+        filters["Group"] = "g"
+        spelled = ", ".join(f"{key}: {value}" for key, value in filters.items())
+        out = self.render(f"""
+            name: f
+            uart_endpoints: [{{name: u, device: /dev/ttyS0, filters: {{{spelled}}}}}]
+            udp_endpoints: [{{name: d, mode: normal, address: 127.0.0.1, filters: {{{spelled}}}}}]
+            tcp_endpoints: [{{name: t, address: 127.0.0.1, port: 1, filters: {{{spelled}}}}}]
+            """)
+        for key in filters:
+            expected = f"{key} = g" if key == "Group" else f"{key} = 1,2"
+            self.assertEqual(out.count(expected + "\n"), 3, key)
+
+    def test_example_documents_every_supported_key(self):
+        """config/mavlink-router.example.yaml is the reference for operators: each key the
+        renderer accepts must appear in it, active or commented out."""
+        renderer = load_renderer()
+        text = EXAMPLE.read_text()
+        keys = (renderer._TOP_KEYS | renderer._GENERAL_KEYS | renderer._LOGGING_KEYS
+                | renderer._UART_KEYS | renderer._UDP_KEYS | renderer._TCP_KEYS)
+        missing = sorted(key for key in keys if not re.search(rf"(?m)^[#\s-]*{key}:", text))
+        self.assertEqual(missing, [], "keys the example config does not show")
+        missing = sorted(key for key in renderer._FILTER_KEYS if key not in text)
+        self.assertEqual(missing, [], "filter keys the example config does not show")
+        for choices in (renderer._LOG_LEVELS, renderer._DIALECTS, renderer._LOG_MODES,
+                        renderer._UDP_MODES):
+            self.assertEqual([choice for choice in choices if choice not in text], [])
 
     def test_omitted_keys_keep_upstream_defaults(self):
         self.assertEqual(self.render("name: bare\n"), textwrap.dedent("""\
@@ -171,6 +220,7 @@ class RenderTests(RenderCase):
             """, "--env")
         self.assertEqual(dict(line.split("=", 1) for line in env.splitlines()), {
             "SERVICE": "mavlink-router", "NAME": "net", "TYPE": "net", "DEVICE": "''",
+            "DEVICE_2": "''", "DEVICE_3": "''", "DEVICE_4": "''",
             "HEALTH_PORT": "5790", "LOGGING": "0"})
         result = self.run_render("--env", EXAMPLE)
         tokens = dict(line.split("=", 1) for line in result.stdout.splitlines())
@@ -178,6 +228,22 @@ class RenderTests(RenderCase):
         self.assertEqual(shlex.split(tokens["DEVICE"]),
                          ["/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0"])
         self.assertEqual(tokens["HEALTH_PORT"], "5760")
+        self.assertEqual(tokens["DEVICE_2"], "''")
+
+    def test_each_uart_gets_its_own_device_token(self):
+        """One serial compose overlay per device: DEVICE, DEVICE_2, ... in endpoint order."""
+        env = self.render("""
+            name: multi
+            uart_endpoints:
+              - {name: fcu, device: /dev/ttyTHS1}
+              - {name: radio, device: "/dev/serial/by-id/usb-Silicon Labs-if00"}
+              - {name: gimbal, device: /dev/ttyUSB7}
+            """.replace("Silicon Labs", "Silicon_Labs"), "--env")
+        tokens = dict(line.split("=", 1) for line in env.splitlines())
+        self.assertEqual([tokens[key] for key in ("TYPE", "DEVICE", "DEVICE_2", "DEVICE_3",
+                                                  "DEVICE_4")],
+                         ["serial", "/dev/ttyTHS1", "/dev/serial/by-id/usb-Silicon_Labs-if00",
+                          "/dev/ttyUSB7", "''"])
 
     def test_unknown_keys_are_refused(self):
         self.assert_rejected("name: n\ngeneral: {tcp_server_prot: 5760}\n", "tcp_server_prot")
@@ -215,6 +281,17 @@ class RenderTests(RenderCase):
         self.assert_rejected(
             "name: n\nudp_endpoints: [{name: a, mode: normal, address: 127.0.0.1,"
             " filters: {BlockSrcSysIn: 256}}]\n", "BlockSrcSysIn")
+        self.assert_rejected("name: n\ngeneral: {sniffer_sysid: 256}\n", "sniffer_sysid")
+        self.assert_rejected("name: n\ngeneral: {dedup_period_ms: -1}\n", "dedup_period_ms")
+        self.assert_rejected("name: n\ngeneral: {report_stats: 1}\n", "report_stats")
+        # the fork's own accepted range for TxQueueSize: one maximum-size frame .. 1 MiB
+        queue = "name: n\nudp_endpoints: [{name: a, mode: normal, address: 127.0.0.1," \
+                " tx_queue_size: %s}]\n"
+        for bad in (279, 1048577, 0, "big", "8192.5"):
+            self.assert_rejected(queue % bad, "tx_queue_size")
+        self.assert_rejected(
+            "name: n\ntcp_endpoints: [{name: a, address: 10.0.0.1, port: 1, retry_timeout: -1}]\n",
+            "retry_timeout")
 
     def test_a_value_cannot_open_another_ini_line(self):
         """`address: "127.0.0.1\\nPort = 1\\n[UartEndpoint x]\\nDevice = /dev/sda"` used to render
@@ -253,9 +330,17 @@ class RenderTests(RenderCase):
             "  - {name: a, mode: normal, address: 127.0.0.1}\n"
             "  - {name: a, mode: normal, address: 127.0.0.2}\n", "duplicate endpoint name")
         self.assert_rejected(
+            "name: n\nuart_endpoints:\n" + "".join(
+                f"  - {{name: u{n}, device: /dev/ttyUSB{n}}}\n" for n in range(5)),
+            "at most 4 UART")
+        self.assert_rejected(
             "name: n\nuart_endpoints:\n"
-            "  - {name: a, device: /dev/ttyUSB0}\n  - {name: b, device: /dev/ttyUSB1}\n",
-            "at most one UART")
+            "  - {name: a, device: /dev/ttyUSB0}\n  - {name: b, device: /dev/ttyUSB0}\n",
+            "already used")
+        self.assert_rejected(
+            "name: n\nuart_endpoints: [{name: a, device: /dev/ttyUSB0}]\n"
+            "udp_endpoints: [{name: a, mode: normal, address: 127.0.0.1}]\n",
+            "duplicate endpoint name")
         self.assert_rejected(
             "name: n\nuart_endpoints:\n"
             "  - {name: a, device: '/dev/serial/by-path/pci-0000:00:14.0-usb-0:2:1.0'}\n",

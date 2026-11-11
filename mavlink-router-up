@@ -5,15 +5,15 @@
 # Reads the config, derives the instance identity (compose project = an inherited
 # COMPOSE_PROJECT_NAME — rig owns it — or mavlink-router_<name> standalone), renders the UPSTREAM
 # router's main.conf INI, and runs `docker compose`. It SELECTS + PARAMETERIZES static compose
-# files — it never generates one: the serial overlay joins only when the config has a UART
-# endpoint, the logging overlay only when logging.enabled is true.
+# files — it never generates one: one serial overlay joins per UART endpoint in the config, the
+# logging overlay only when logging.enabled is true.
 #
-#   mavlink-router-up configs/fcu.yaml             # up (foreground)
-#   mavlink-router-up configs/fcu.yaml up -d       # detached
-#   mavlink-router-up configs/fcu.yaml status      # docker compose ps
-#   mavlink-router-up configs/fcu.yaml logs -f
-#   mavlink-router-up configs/fcu.yaml down
-#   mavlink-router-up configs/fcu.yaml config      # render the merged compose
+#   mavlink-router-up config/fcu.yaml              # up (foreground)
+#   mavlink-router-up config/fcu.yaml up -d        # detached
+#   mavlink-router-up config/fcu.yaml status       # docker compose ps
+#   mavlink-router-up config/fcu.yaml logs -f
+#   mavlink-router-up config/fcu.yaml down
+#   mavlink-router-up config/fcu.yaml config       # render the merged compose
 #   mavlink-router-up /any/host/path/fcu.yaml up -d    # config from anywhere (rig)
 #
 # rig's image-plan verbs (read-only: nothing is rendered, started or pulled):
@@ -54,7 +54,7 @@ case "${1:-}" in
     ;;
 esac
 
-# config -> validated instance identity + derived tokens (SERVICE / NAME / TYPE / DEVICE /
+# config -> validated instance identity + derived tokens (SERVICE / NAME / TYPE / DEVICE[_N] /
 # HEALTH_PORT / LOGGING), with the router config rendered to its host staging path (CONF_HOST, one
 # file per instance; CONF_SHA256 is its content hash). ONE renderer pass, captured before the
 # eval so a rejected config stops right here with the renderer's own message. Values are
@@ -77,8 +77,17 @@ export MAVROUTER_HEALTH_PORT="$HEALTH_PORT"
 
 FILES=(-f "$COMPOSE")
 if [ "$TYPE" = "serial" ]; then
+  # One fixed overlay per serial device, in uart_endpoints order: the first UART's is
+  # compose.deploy.serial.yaml (MAVROUTER_DEVICE), the Nth's compose.deploy.serial<N>.yaml
+  # (MAVROUTER_DEVICE_<N>). The renderer caps the UART count at the overlays that exist.
   export MAVROUTER_DEVICE="${DEVICE:?serial config needs uart_endpoints[0].device}"
   FILES+=(-f "$REPO/docker/compose/compose.deploy.serial.yaml")
+  for slot in 2 3 4; do
+    token="DEVICE_$slot"
+    [ -n "${!token:-}" ] || break
+    export "MAVROUTER_DEVICE_$slot=${!token}"
+    FILES+=(-f "$REPO/docker/compose/compose.deploy.serial$slot.yaml")
+  done
 fi
 if [ "$LOGGING" = "1" ]; then
   FILES+=(-f "$REPO/docker/compose/compose.deploy.logging.yaml")

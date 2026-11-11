@@ -1,0 +1,7 @@
+# Serial overlay for the SECOND UART endpoint (uart_endpoints[1].device, exported by
+# `mavlink-router-up` as MAVROUTER_DEVICE_2). Always layered on top of
+# compose.deploy.serial.yaml, which documents the mapping and grants the dialout group.
+services:
+  router:
+    devices:
+      - "${MAVROUTER_DEVICE_2}:${MAVROUTER_DEVICE_2}"

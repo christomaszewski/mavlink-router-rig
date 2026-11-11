@@ -1,0 +1,184 @@
+# mavlink-router — example instance config (a thin rig wrap of upstream mavlink-router).
+#
+# ONE instance is one MAVLink hub: every message arriving on one endpoint is forwarded to the
+# others, so a single router connects the flight controller to the ground station, the onboard
+# autonomy stack and any dynamic TCP client. tools/render_conf.py turns this file into the
+# router's main.conf; a key you leave out keeps upstream's default, an unknown key or a value
+# the router would refuse is an error at `up` (never a crash loop on the vehicle).
+#
+# Under rig:     rig add ../mavlink-router-rig     (or: rig add public/mavlink-router)
+#                copies this file to config/infra/fcu.yaml and wires the vehicle.yaml row;
+#                edit it, then `rig doctor && rig up`
+# Standalone:    cp config/mavlink-router.example.yaml config/fcu.yaml
+#                ./mavlink-router-up config/fcu.yaml up -d      (status | logs -f | down)
+#
+# Every option the router has is in this file: the active lines are a typical vehicle (FCU on a
+# serial port, a ground station and an onboard stack on UDP); the rest is commented out at its
+# default. This is also the config CI certifies the launcher against.
+#
+# How the router decides where a message goes — worth knowing before adding endpoints:
+#   * It learns which MAVLink systems/components sit behind an endpoint from what arrives there.
+#   * A broadcast message (no target, or target system 0) goes to every OTHER endpoint; a message
+#     addressed to a system goes only to the endpoint(s) that system was seen on, and is dropped
+#     when the target was never seen. Nothing is sent back to the endpoint it came from.
+#   * Frames are forwarded byte for byte (MAVLink 1 and 2, signed or not). Message ids the router
+#     does not know are forwarded too; a known message with a bad checksum is dropped.
+
+service: mavlink-router
+name: fcu                       # instance id: [a-z][a-z0-9_]*. Under rig the vehicle.yaml row's
+                                # name must match; standalone it names the compose project
+                                # (mavlink-router_fcu). Run a second instance for a second,
+                                # separate MAVLink network — mind the host ports below.
+
+# --------------------------------------------------------------------------------------------------
+general:
+  tcp_server_port: 5760         # TCP server for dynamic clients (QGroundControl over TCP, MAVProxy,
+                                # debugging): each connection is one more endpoint. 0 disables it.
+                                # Default 5760. Host networking: the port is taken on the vehicle
+                                # itself, on every interface — it is also what the container
+                                # healthcheck probes (0 = the check falls back to "process alive").
+  debug_log_level: info         # error | warning | info | debug | trace   (default info)
+                                # goes to stderr -> `rig logs`. trace prints every routed message.
+  # report_stats: false         # true = per-endpoint counters once a second on stdout (messages,
+  #                             # bytes, CRC errors, sequence gaps) — a link-quality check to turn
+  #                             # on while debugging, noisy otherwise
+  # dedup_period_ms: 0          # > 0 = drop a frame identical to one seen within this many ms.
+  #                             # For REDUNDANT links carrying the same stream (two radios to one
+  #                             # ground station). Set it a little above the slowest link's
+  #                             # latency; above ~1000 it starts eating legitimate repeats.
+  #                             # 0 (default) = off — leave it off without redundant links.
+  # sniffer_sysid: 0            # 1..255 = an endpoint on which this MAVLink SYSTEM id shows up
+  #                             # receives ALL traffic, addressed to it or not (a logger or
+  #                             # monitor that must see everything). 0 (default) = off.
+  #                             # 2 is the router's own logging system: set it to make the
+  #                             # telemetry log complete (see `logging` below).
+  # mavlink_dialect: auto       # auto | common | ardupilotmega — which flight-stack log protocol
+  #                             # `logging` speaks: auto (default) picks from the autopilot's
+  #                             # heartbeat (PX4 -> .ulg, ArduPilot -> .bin); common forces the
+  #                             # PX4/ULog one, ardupilotmega the ArduPilot/dataflash one.
+
+# --------------------------------------------------------------------------------------------------
+# Serial links: the flight controller, a serial telemetry radio. Up to 4 per instance (each one
+# is passed into the container by its own compose overlay).
+uart_endpoints:
+  - name: fcu                   # endpoint name, [a-z][a-z0-9_]*, unique across ALL endpoints
+    device: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0
+                                # absolute path of the host device; the container sees the same
+                                # path. Use the stable /dev/serial/by-id/... name — NOT
+                                # /dev/ttyUSB0 (renumbers on replug) and NOT /dev/serial/by-path
+                                # (its colons break the compose device mapping; refused). The
+                                # device must exist at `up`, and after an adapter re-enumerates
+                                # the container needs `up -d --force-recreate`.
+    baud: 500000                # one rate, or a list such as [57600, 921600]: the router cycles
+                                # through the list every 5 s until valid MAVLink arrives.
+                                # Default 115200.
+    # flow_control: false       # true = RTS/CTS hardware flow control (default false)
+    # tx_queue_size: 8192       # FORK BUILD ONLY — see "tx_queue_size" at the end of this file
+    # filters: {}               # see "filters" at the end of this file
+  # - name: radio               # a second serial link, e.g. a SiK/RFD900 telemetry radio
+  #   device: /dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0
+  #   baud: 57600
+  #   flow_control: true
+
+# --------------------------------------------------------------------------------------------------
+# UDP links. Addresses are IP literals — the router resolves no hostnames. IPv6 goes in
+# brackets, lowercase and quoted: "[::1]", "[fe80::1]".
+udp_endpoints:
+  - name: gcs                   # ground station that calls in (QGroundControl, MAVProxy --out)
+    mode: server                # server = BIND address:port and wait. The router can only answer
+                                # once the peer has sent something, and always answers the
+                                # address the LAST datagram came from — so the link follows a
+                                # ground station that restarts or changes address.
+    address: 0.0.0.0            # the local address to bind: 0.0.0.0 (or "[::]") = every
+                                # interface, 127.0.0.1 = this host only, or one interface's IP
+    port: 14550                 # required in server mode (1..65535)
+  - name: autonomy              # onboard stack (MAVSDK, MAVROS) listening on this host
+    mode: normal                # normal = SEND TO address:port from the first message on; the
+                                # peer's replies come back on the same socket. Use it towards
+                                # anything that listens on a known port. With a broadcast or
+                                # multicast address (192.168.1.255, "[ff02::1]") the router
+                                # broadcasts until someone answers, then talks to that one peer,
+                                # and falls back to broadcasting after 5 s of silence.
+    address: 127.0.0.1
+    port: 14540                 # optional in normal mode: left out, the router sends to 14550
+                                # (14551 when an earlier endpoint already sends to that address
+                                # on 14550) — clearer to always write it
+    # tx_queue_size: 8192       # FORK BUILD ONLY — see the end of this file
+    # filters: {}               # see the end of this file
+
+# --------------------------------------------------------------------------------------------------
+# TCP client links: the router dials OUT and keeps the connection up (another router, a cloud
+# relay, SITL listening on TCP). Inbound TCP needs no entry — that is general.tcp_server_port.
+# tcp_endpoints:
+#   - name: relay
+#     address: 192.168.1.20     # IP literal of the server to connect to
+#     port: 5761                # required (1..65535)
+#     retry_timeout: 5          # seconds between reconnect attempts, also when the server is not
+#                               # up yet at start (default 5). 0 = never reconnect: one failed or
+#                               # dropped connection and the endpoint stays dead until a restart.
+#     # tx_queue_size: 8192     # FORK BUILD ONLY — see the end of this file
+#     # filters: {}             # see the end of this file
+
+# --------------------------------------------------------------------------------------------------
+# Flight logs, recorded by the router itself (off unless enabled):
+#   * the FLIGHT-STACK log, streamed by the autopilot on request — ArduPilot dataflash (.bin;
+#     needs LOG_BACKEND_TYPE to include MAVLink) or PX4 ULog (.ulg). This is the full-rate log the
+#     autopilot would write to its SD card, pulled off the vehicle link as it is produced.
+#   * optionally the raw TELEMETRY stream as a .tlog (timestamped frames — what QGroundControl
+#     and Mission Planner replay). The log is routed to like any endpoint, so it holds BROADCAST
+#     traffic only (heartbeats, attitude, status ...); commands and replies addressed to one
+#     system are left out unless general.sniffer_sysid is 2.
+# Recording starts when the first heartbeat from an autopilot (MAVLink component 1) arrives,
+# and advances on traffic — a silent link records nothing.
+# Files are named <counter>-<date>_<time>.<ext> (UTC) and land in
+#     $RIG_DATA_DIR/current/mavlink-router/<name>/   under rig, in the run that is open
+#     $RIG_DATA_DIR/mavlink-router/<name>/           standalone, or with no run open
+# The directory is fixed when the CONTAINER starts: a log stays in the run it began in, and a new
+# run is picked up at the next `up` (rig only opens a new run while the deployment is down).
+# logging:
+#   enabled: true               # adds the logging compose overlay; needs RIG_DATA_DIR (rig sets
+#                               # it from the deployment's data_dir; standalone: export it)
+#   mode: always                # always (default): one log per router start, from the first
+#                               # heartbeat. while-armed: a new log each time the vehicle arms,
+#                               # closed when it disarms.
+#   telemetry: false            # true = also write the .tlog (same mode). Default false.
+#   log_system_id: 1            # 1..255: record THIS MAVLink system. Default: the system of the
+#                               # first autopilot heartbeat seen — set it when more than one
+#                               # vehicle shares the network.
+#   max_log_files: 50           # when a log is started, keep at most this many FINISHED log
+#                               # files in the directory (oldest go first); the one being
+#                               # written comes on top. Default 0 = unlimited.
+#   min_free_space_mb: 512      # when a log is started, delete the oldest finished logs until
+#                               # this much disk is free (MB). Default 0 = off.
+#                               # Set at least one of the two — unbounded logs are how a vehicle
+#                               # fills its disk. Both act on the directory being written; logs
+#                               # of earlier (sealed) runs are never touched.
+
+# --------------------------------------------------------------------------------------------------
+# filters — any endpoint (uart/udp/tcp) may carry a `filters:` map limiting what it carries.
+# Ids are one integer or a list. An Allow list, once given, passes ONLY what it names; a Block
+# list drops what it names; a message must pass every filter set on the endpoint.
+#   ...Out = what the router may SEND to this endpoint      ...In = what it ACCEPTS from it
+#   AllowMsgIdOut / BlockMsgIdOut       by MAVLink message id          (0 = HEARTBEAT, 30 = ATTITUDE)
+#   AllowSrcSysOut / BlockSrcSysOut     by the SENDER's system id      (1..255)
+#   AllowSrcCompOut / BlockSrcCompOut   by the SENDER's component id   (1 = autopilot, 190 = GCS)
+#   AllowMsgIdIn / BlockMsgIdIn, AllowSrcSysIn / BlockSrcSysIn, AllowSrcCompIn / BlockSrcCompIn
+#   Group: <name>                       endpoints sharing a group name are parallel links to the
+#                                       SAME peer (two radios to one ground station): what
+#                                       arrives on one is never sent out on the other, and both
+#                                       carry everything else. Pair it with dedup_period_ms.
+# Examples:
+#   a bandwidth-poor radio gets only heartbeat, system status and position:
+#       filters: {AllowMsgIdOut: [0, 1, 24, 33]}
+#   a payload computer may listen but its commands are not accepted:
+#       filters: {BlockMsgIdIn: [76, 75, 11]}
+#   only the autopilot's own messages go to the cloud relay:
+#       filters: {AllowSrcSysOut: 1, AllowSrcCompOut: 1}
+#
+# tx_queue_size — FORK BUILD ONLY (an image built with MAVROUTER_SOURCE=fork; the upstream build
+# ignores the key and the container says so in its log). Bytes of transmit queue for one
+# endpoint: when the link cannot take a message right away (a slow radio fed by a fast autopilot)
+# messages wait here instead of being lost, and once the queue is full the OLDEST are dropped
+# first. Larger rides out longer stalls but lets a saturated link carry staler data.
+# 280 (one maximum-size frame) .. 1048576; default 8192 (about 30 maximum-size frames).
+# Connections accepted on tcp_server_port always use the default.

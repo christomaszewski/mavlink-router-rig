@@ -2,8 +2,15 @@
 # `mavlink-router-up` adds this as a second `-f` only when the config has a UART endpoint,
 # exporting MAVROUTER_DEVICE = uart_endpoints[0].device. The same stable /dev/serial/by-id path
 # is used as the in-container device, so the rendered main.conf needs no path rewriting.
-# (render_conf.py rejects by-path device paths — their colons would break the mapping below —
-# and enforces at most ONE UART endpoint, the single slot this overlay carries.)
+# (render_conf.py rejects by-path device paths — their colons would break the mapping below.)
+#
+# One overlay carries ONE device. A second, third and fourth UART endpoint each add their own:
+# compose.deploy.serial2.yaml .. serial4.yaml (MAVROUTER_DEVICE_2 .. _4). The dialout group is
+# granted here, once, because this overlay is part of every serial launch.
+#
+# The device node is resolved when the container is CREATED: the host path must exist at `up`
+# (a missing device fails `up` by name), and an adapter that re-enumerates under another kernel
+# name while the container lives needs `up -d --force-recreate` to be picked up again.
 services:
   router:
     devices:
